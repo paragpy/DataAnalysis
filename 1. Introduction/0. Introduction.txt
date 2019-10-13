@@ -1,0 +1,16 @@
+Here we learn the Python tools to work productively with data. The task required generally fall into a number of different broad groups:
+
+1. Interacting with outside world
+    > Reading and working with a variety of file format and databases.
+    
+2. Preparation
+    > Cleaning, munging, combining, normalizing, reshaping, slicing and dicing, and transform data for analysis
+    
+3. Transformation
+    > Apply mathematical and statistical operation to group of the data sets to derive new datasets. For example, aggregating a large table by group variables.
+    
+4. Modeling and computation
+    > Connecting your data to statistical models, machine learning algorithms, or other computational tools
+    
+5. Presentation
+    > Creating interactive or static graphical visualization or textual summarization

@@ -1,0 +1,13 @@
+NumPy, shorts for Numerical Python, is the fundamental package required for high performance scientific computing and data analysis. It is the foundation on which nearly all of the higher-level tools are built.
+
+> ndarray, a fast and space-efficient multidimensional array providing vectorized arithmetic operations and sophositicated boradcasting capabilites.
+
+> Standard mathematical funcitons for fast operations on entire arrays of data without having to write for loops.
+
+> Tools for reading / writing array data to disk and working with memory-mapped files.
+
+> Linear Algebra, random number generation, and Fourier transform capabilities.
+
+> Tools for integrating code written in C, C++, and Forton
+
+NumPy provides an easy-to-use C API, it is very easy to pass data to external libraries written in a low-level language and also for external libraries to written data to Python as NumPy arrays. This feature made Python a language of choice for wrapping legacy C/C++/Forton codebases and giving them a dynamic and easy-to-use interface.
