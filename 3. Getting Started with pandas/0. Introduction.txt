@@ -1,0 +1,13 @@
+pandas contains high-level data structures and manipulation tool designed to make data analysis fast and easy in Python. pandas are built on top of NumPy and makes it easy to use in NumPy-centeric applications.
+
+> Data structues with labeled axes supporting automatic or explicit data alignment. This prevents common error resulting from misaligned data and working with differently-indexed dat coming from different sources.
+
+> Integrated time series functionality.
+
+> The same data structures handle both time series data and non-times series data.
+
+> Arithmetic operations and reductuions (like summing across axis) would pass on the metadata (axis labels).
+
+> Flexible handling of missing data.
+
+> Merge and other relational operations found in popular datatbase (SQL-based, for example).
