@@ -1,16 +1,379 @@
-Here we learn the Python tools to work productively with data. The task required generally fall into a number of different broad groups:
+"""
+TOML-based Schema Enforcer for NebulaGraph-style schemas.
 
-1. Interacting with outside world
-    > Reading and working with a variety of file format and databases.
-    
-2. Preparation
-    > Cleaning, munging, combining, normalizing, reshaping, slicing and dicing, and transform data for analysis
-    
-3. Transformation
-    > Apply mathematical and statistical operation to group of the data sets to derive new datasets. For example, aggregating a large table by group variables.
-    
-4. Modeling and computation
-    > Connecting your data to statistical models, machine learning algorithms, or other computational tools
-    
-5. Presentation
-    > Creating interactive or static graphical visualization or textual summarization
+This module loads a NebulaGraph schema from a TOML file (e.g., sample_schemt.toml)
+and validates payloads for tags/edges according to:
+  - Property types and nullability
+  - Defaults and required fields
+  - FIXED_STRING(n) maximum length
+  - Project validation rules in [validation.rules]
+  - Space VID length derived from space.vid_type (FIXED_STRING(n))
+
+Python: 3.8+ (uses 'tomllib' if 3.11+, otherwise falls back to 'tomli').
+
+Typical usage:
+    schema = TomlSchema.from_toml("sample_schemt.toml")
+
+    ok, errors, fixed_payload = schema.validate(
+        kind="tag", label="Policy",
+        payload={"name": "HR Policy", "type": "policy", "version_number": "1.2.3"},
+        allow_extra=False, coerce=True, apply_defaults=True
+    )
+
+    # Validate a VID (for ETL / Load layers)
+    ok_vid, vid_err = schema.validate_vid("POLICY-000123")
+
+Notes:
+- TIMESTAMP accepts ISO-8601-like strings or int/float epoch seconds; "now()" is allowed.
+- BOOL accepts typical truthy/falsey strings ("true"/"false", "yes"/"no", "1"/"0").
+- For edges with empty properties, validation is still supported.
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Any, Dict, Tuple, Optional, Callable
+import re
+import pathlib
+import json
+from datetime import datetime
+
+# ---------- TOML loader ----------
+try:
+    import tomllib  # Python 3.11+
+    _load_toml: Callable[[bytes], dict] = tomllib.loads
+except Exception:
+    try:
+        import tomli as tomllib  # type: ignore
+        _load_toml = tomllib.loads
+    except Exception:
+        tomllib = None
+        _load_toml = None
+
+
+_SEMVER_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:[-+].*)?$")
+_FIXSTR_RE = re.compile(r"^FIXED_STRING\((\d+)\)$", re.IGNORECASE)
+
+# ---------- Nebula -> Python type inference ----------
+def _parse_nebula_type(type_str: str) -> Tuple[str, Optional[int], type]:
+    """
+    Returns (nebula_base, max_len, py_type)
+      - nebula_base: 'FIXED_STRING', 'STRING', 'TIMESTAMP', 'BOOL', 'INT', 'DOUBLE' ...
+      - max_len: integer only for FIXED_STRING(n)
+      - py_type: expected Python type for value checking/coercion
+    """
+    t = type_str.strip().upper()
+    m = _FIXSTR_RE.match(t)
+    if m:
+        return ("FIXED_STRING", int(m.group(1)), str)
+
+    # Basic mappings (extend as needed)
+    if t in {"STRING", "TEXT"}:
+        return ("STRING", None, str)
+    if t in {"BOOL", "BOOLEAN"}:
+        return ("BOOL", None, bool)
+    if t in {"INT", "INTEGER", "INT32", "INT64"}:
+        return ("INT", None, int)
+    if t in {"FLOAT", "DOUBLE", "NUMBER"}:
+        return ("DOUBLE", None, float)
+    if t in {"TIMESTAMP", "DATETIME", "DATE"}:
+        # We'll accept str or numeric epoch and coerce to str/epoch transparently
+        return ("TIMESTAMP", None, (str, int, float))
+
+    # Fallback: treat as string
+    return (t, None, str)
+
+
+def _coerce(value: Any, py_type: type | tuple[type, ...]) -> Tuple[bool, Any]:
+    """Best-effort coercion to the provided python type(s)."""
+    if isinstance(py_type, tuple):
+        # Accept any of the allowed types without coercion
+        if isinstance(value, py_type):
+            return True, value
+        # Heuristics for timestamp as a common multi-type
+        if str in py_type and isinstance(value, (int, float)):
+            # allow epoch -> str ISO8601
+            try:
+                return True, datetime.utcfromtimestamp(float(value)).isoformat() + "Z"
+            except Exception:
+                return False, value
+        if (int in py_type or float in py_type) and isinstance(value, str):
+            # maybe a numeric string
+            try:
+                if "." in value:
+                    return True, float(value)
+                return True, int(value)
+            except Exception:
+                return False, value
+        # last-resort: keep as string
+        try:
+            return True, str(value)
+        except Exception:
+            return False, value
+
+    # Single type
+    if py_type is bool:
+        if isinstance(value, bool):
+            return True, value
+        if isinstance(value, (int, float)):
+            return True, bool(value)
+        if isinstance(value, str):
+            v = value.strip().lower()
+            if v in {"true", "1", "yes", "y"}:
+                return True, True
+            if v in {"false", "0", "no", "n"}:
+                return True, False
+        return False, value
+
+    if py_type is int:
+        try:
+            return True, int(value)
+        except Exception:
+            return False, value
+
+    if py_type is float:
+        try:
+            return True, float(value)
+        except Exception:
+            return False, value
+
+    if py_type is str:
+        try:
+            return True, str(value)
+        except Exception:
+            return False, value
+
+    # Fallback: no coercion
+    return isinstance(value, py_type), value
+
+
+def _is_timestamp_like(s: str) -> bool:
+    if s.strip().lower() == "now()":
+        return True
+    try:
+        # Loose ISO-8601 acceptance
+        datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return True
+    except Exception:
+        return False
+
+
+@dataclass
+class PropertySpec:
+    name: str
+    nebula_base: str
+    max_len: Optional[int]
+    py_type: type | tuple[type, ...]
+    nullable: bool
+    has_default: bool
+    default: Any
+    comment: str = ""
+
+    def check_value(self, value: Any, *, coerce: bool) -> Tuple[bool, Any, Optional[str]]:
+        """Validate and optionally coerce a single property value."""
+        # Null handling
+        if value is None:
+            if not self.nullable and not self.has_default:
+                return False, value, "None not allowed"
+            return True, value, None
+
+        # Type checks + coercion
+        ok, new_val = _coerce(value, self.py_type) if coerce else (isinstance(value, self.py_type), value)
+        if not ok:
+            pyname = (
+                "/".join(t.__name__ for t in self.py_type)  # type: ignore
+                if isinstance(self.py_type, tuple) else self.py_type.__name__
+            )
+            return False, value, f"expected {pyname}, got {type(value).__name__}"
+
+        # Extra semantics
+        if self.nebula_base == "FIXED_STRING" and isinstance(new_val, str) and self.max_len is not None:
+            if len(new_val) > self.max_len:
+                return False, new_val, f"exceeds FIXED_STRING({self.max_len}) length"
+        if self.nebula_base == "TIMESTAMP":
+            # Allow "now()", ISO strings, or numeric epoch (already coerced above)
+            if isinstance(new_val, str) and not _is_timestamp_like(new_val):
+                return False, new_val, "invalid timestamp format"
+        return True, new_val, None
+
+
+class TomlSchema:
+    def __init__(self, *, raw: dict):
+        self.raw = raw
+        self.space = raw.get("space", {}) or {}
+        self.tags = (raw.get("tags", {}) or {})
+        self.edges = (raw.get("edges", {}) or {})
+        self.rules = (raw.get("validation", {}).get("rules", {}) if raw.get("validation") else {}) or {}
+        self._vid_len_from_space = self._infer_vid_len(self.space.get("vid_type"))
+
+        # Pre-compile property specs for quick access
+        self._tag_specs: Dict[str, Dict[str, PropertySpec]] = self._build_specs(self.tags)
+        self._edge_specs: Dict[str, Dict[str, PropertySpec]] = self._build_specs(self.edges)
+
+    # ---------- Construction ----------
+    @classmethod
+    def from_toml(cls, path: str | pathlib.Path) -> "TomlSchema":
+        if _load_toml is None:
+            raise RuntimeError("No TOML parser available. Use Python 3.11+ or install 'tomli'.")
+        text = pathlib.Path(path).read_text(encoding="utf-8")
+        raw = _load_toml(text.encode("utf-8"))
+        return cls(raw=raw)
+
+    # ---------- Internal helpers ----------
+    @staticmethod
+    def _infer_vid_len(vid_type: Optional[str]) -> Optional[int]:
+        if not vid_type or not isinstance(vid_type, str):
+            return None
+        m = _FIXSTR_RE.match(vid_type.strip().upper())
+        if m:
+            return int(m.group(1))
+        return None
+
+    @staticmethod
+    def _build_specs(section: dict) -> Dict[str, Dict[str, PropertySpec]]:
+        compiled: Dict[str, Dict[str, PropertySpec]] = {}
+        for label, defn in (section or {}).items():
+            props = defn.get("properties", {}) or {}
+            specmap: Dict[str, PropertySpec] = {}
+            for pname, meta in props.items():
+                nebula_base, max_len, py_type = _parse_nebula_type(str(meta.get("type", "STRING")))
+                nullable = bool(meta.get("nullable", False))
+                has_default = "default" in meta
+                default = meta.get("default")
+                comment = str(meta.get("comment", "")) if meta.get("comment") is not None else ""
+                specmap[pname] = PropertySpec(
+                    name=pname,
+                    nebula_base=nebula_base,
+                    max_len=max_len,
+                    py_type=py_type,
+                    nullable=nullable,
+                    has_default=has_default,
+                    default=default,
+                    comment=comment,
+                )
+            compiled[label] = specmap
+        return compiled
+
+    def _props(self, kind: str, label: str) -> Dict[str, PropertySpec]:
+        if kind == "tag":
+            if label not in self._tag_specs:
+                raise KeyError(f"Unknown tag '{label}'")
+            return self._tag_specs[label]
+        if kind == "edge":
+            if label not in self._edge_specs:
+                raise KeyError(f"Unknown edge '{label}'")
+            return self._edge_specs[label]
+        raise ValueError("kind must be 'tag' or 'edge'")
+
+    # ---------- Public helpers ----------
+    def template(self, kind: str, label: str) -> Dict[str, Any]:
+        """Return a dict with keys for all properties and defaulted values (None if no default)."""
+        out = {}
+        for k, spec in self._props(kind, label).items():
+            out[k] = spec.default if spec.has_default else None
+        return out
+
+    def validate(
+        self,
+        *,
+        kind: str,                  # 'tag' | 'edge'
+        label: str,
+        payload: Dict[str, Any],
+        allow_extra: bool = False,
+        coerce: bool = True,
+        apply_defaults: bool = False,
+    ) -> Tuple[bool, Dict[str, str], Dict[str, Any]]:
+        """
+        Validate a payload for a given tag/edge.
+
+        Returns: (ok, errors, fixed_payload)
+          - ok: True if no errors
+          - errors: field->message
+          - fixed_payload: possibly coerced & default-applied payload (copy)
+        """
+        props = self._props(kind, label)
+        errors: Dict[str, str] = {}
+        fixed = dict(payload)  # work on a copy
+
+        # Required / defaults
+        for name, spec in props.items():
+            if name not in fixed:
+                if apply_defaults and spec.has_default:
+                    fixed[name] = spec.default
+                elif not spec.nullable and not spec.has_default:
+                    errors[name] = "missing required field"
+
+        # Unknown fields
+        if not allow_extra:
+            for k in list(fixed.keys()):
+                if k not in props:
+                    errors[k] = "unknown field"
+
+        # Per-field type/semantics
+        for name, value in list(fixed.items()):
+            spec = props.get(name)
+            if not spec:
+                continue
+            ok, new_val, err = spec.check_value(value, coerce=coerce)
+            if not ok and err:
+                errors[name] = err
+            else:
+                fixed[name] = new_val
+
+        # Project-level rules
+        self._apply_rules(label=label, kind=kind, payload=fixed, errors=errors)
+
+        return len(errors) == 0, errors, fixed
+
+    def validate_vid(self, vid: Any) -> Tuple[bool, Optional[str]]:
+        """Validate a VID according to vid_type and validation.rules.enforce_vid_length."""
+        # Only enforce for string VIDs and known length limits.
+        if vid is None:
+            return False, "VID is required"
+        if not isinstance(vid, str):
+            return False, "VID must be a string"
+
+        limit = None
+        # First preference: explicit rule
+        if isinstance(self.rules.get("enforce_vid_length"), int):
+            limit = int(self.rules["enforce_vid_length"])
+        # Otherwise: derive from space.vid_type
+        if limit is None:
+            limit = self._vid_len_from_space
+
+        if isinstance(limit, int):
+            if len(vid) > limit:
+                return False, f"VID exceeds FIXED_STRING({limit}) length"
+        return True, None
+
+    # ---------- Rule enforcements ----------
+    def _apply_rules(self, *, label: str, kind: str, payload: Dict[str, Any], errors: Dict[str, str]) -> None:
+        rules = self.rules or {}
+
+        # require_non_empty_name
+        if rules.get("require_non_empty_name"):
+            if "name" in payload:
+                v = payload.get("name")
+                if v is None or (isinstance(v, str) and len(v.strip()) == 0):
+                    errors["name"] = "name must be non-empty"
+
+        # require_semver_version
+        if rules.get("require_semver_version"):
+            if "version_number" in payload and payload.get("version_number") is not None:
+                v = str(payload["version_number"]).strip()
+                if not _SEMVER_RE.match(v):
+                    errors["version_number"] = "version_number must be a semantic version (e.g., 1.2.3)"
+
+        # allowed_types
+        allowed = rules.get("allowed_types")
+        if isinstance(allowed, list) and "type" in payload and payload.get("type") is not None:
+            tval = str(payload["type"]).strip().lower()
+            allowed_norm = {str(x).strip().lower() for x in allowed}
+            if tval not in allowed_norm:
+                errors["type"] = f"type must be one of {sorted(allowed_norm)}"
+
+        # (Optional) Custom label-specific constraints can be added here if needed.
+
+    # ---------- Utilities ----------
+    @staticmethod
+    def dump_json(obj: Any, path: str | pathlib.Path) -> None:
+        pathlib.Path(path).write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
