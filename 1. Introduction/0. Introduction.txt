@@ -1,379 +1,554 @@
-"""
-TOML-based Schema Enforcer for NebulaGraph-style schemas.
-
-This module loads a NebulaGraph schema from a TOML file (e.g., sample_schemt.toml)
-and validates payloads for tags/edges according to:
-  - Property types and nullability
-  - Defaults and required fields
-  - FIXED_STRING(n) maximum length
-  - Project validation rules in [validation.rules]
-  - Space VID length derived from space.vid_type (FIXED_STRING(n))
-
-Python: 3.8+ (uses 'tomllib' if 3.11+, otherwise falls back to 'tomli').
-
-Typical usage:
-    schema = TomlSchema.from_toml("sample_schemt.toml")
-
-    ok, errors, fixed_payload = schema.validate(
-        kind="tag", label="Policy",
-        payload={"name": "HR Policy", "type": "policy", "version_number": "1.2.3"},
-        allow_extra=False, coerce=True, apply_defaults=True
-    )
-
-    # Validate a VID (for ETL / Load layers)
-    ok_vid, vid_err = schema.validate_vid("POLICY-000123")
-
-Notes:
-- TIMESTAMP accepts ISO-8601-like strings or int/float epoch seconds; "now()" is allowed.
-- BOOL accepts typical truthy/falsey strings ("true"/"false", "yes"/"no", "1"/"0").
-- For edges with empty properties, validation is still supported.
-"""
-
 from __future__ import annotations
-from dataclasses import dataclass
-from typing import Any, Dict, Tuple, Optional, Callable
+
 import re
-import pathlib
-import json
+import time
+import typing as t
+from dataclasses import dataclass, field
 from datetime import datetime
 
-# ---------- TOML loader ----------
 try:
     import tomllib  # Python 3.11+
-    _load_toml: Callable[[bytes], dict] = tomllib.loads
-except Exception:
-    try:
-        import tomli as tomllib  # type: ignore
-        _load_toml = tomllib.loads
-    except Exception:
-        tomllib = None
-        _load_toml = None
+except ModuleNotFoundError:
+    import tomli as tomllib  # type: ignore
 
 
-_SEMVER_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:[-+].*)?$")
-_FIXSTR_RE = re.compile(r"^FIXED_STRING\((\d+)\)$", re.IGNORECASE)
+# =============================
+# Exceptions
+# =============================
 
-# ---------- Nebula -> Python type inference ----------
-def _parse_nebula_type(type_str: str) -> Tuple[str, Optional[int], type]:
-    """
-    Returns (nebula_base, max_len, py_type)
-      - nebula_base: 'FIXED_STRING', 'STRING', 'TIMESTAMP', 'BOOL', 'INT', 'DOUBLE' ...
-      - max_len: integer only for FIXED_STRING(n)
-      - py_type: expected Python type for value checking/coercion
-    """
-    t = type_str.strip().upper()
-    m = _FIXSTR_RE.match(t)
-    if m:
-        return ("FIXED_STRING", int(m.group(1)), str)
+class SchemaError(Exception):
+    pass
 
-    # Basic mappings (extend as needed)
-    if t in {"STRING", "TEXT"}:
-        return ("STRING", None, str)
-    if t in {"BOOL", "BOOLEAN"}:
-        return ("BOOL", None, bool)
-    if t in {"INT", "INTEGER", "INT32", "INT64"}:
-        return ("INT", None, int)
-    if t in {"FLOAT", "DOUBLE", "NUMBER"}:
-        return ("DOUBLE", None, float)
-    if t in {"TIMESTAMP", "DATETIME", "DATE"}:
-        # We'll accept str or numeric epoch and coerce to str/epoch transparently
-        return ("TIMESTAMP", None, (str, int, float))
-
-    # Fallback: treat as string
-    return (t, None, str)
+class ValidationError(Exception):
+    def __init__(self, message: str, details: t.Optional[dict] = None):
+        super().__init__(message)
+        self.details = details or {}
 
 
-def _coerce(value: Any, py_type: type | tuple[type, ...]) -> Tuple[bool, Any]:
-    """Best-effort coercion to the provided python type(s)."""
-    if isinstance(py_type, tuple):
-        # Accept any of the allowed types without coercion
-        if isinstance(value, py_type):
-            return True, value
-        # Heuristics for timestamp as a common multi-type
-        if str in py_type and isinstance(value, (int, float)):
-            # allow epoch -> str ISO8601
-            try:
-                return True, datetime.utcfromtimestamp(float(value)).isoformat() + "Z"
-            except Exception:
-                return False, value
-        if (int in py_type or float in py_type) and isinstance(value, str):
-            # maybe a numeric string
-            try:
-                if "." in value:
-                    return True, float(value)
-                return True, int(value)
-            except Exception:
-                return False, value
-        # last-resort: keep as string
-        try:
-            return True, str(value)
-        except Exception:
-            return False, value
+# =============================
+# Type parsing / models
+# =============================
 
-    # Single type
-    if py_type is bool:
-        if isinstance(value, bool):
-            return True, value
-        if isinstance(value, (int, float)):
-            return True, bool(value)
-        if isinstance(value, str):
-            v = value.strip().lower()
-            if v in {"true", "1", "yes", "y"}:
-                return True, True
-            if v in {"false", "0", "no", "n"}:
-                return True, False
-        return False, value
+@dataclass
+class NebulaType:
+    base: str
+    arg: t.Optional[int] = None  # e.g., FIXED_STRING(200)
 
-    if py_type is int:
-        try:
-            return True, int(value)
-        except Exception:
-            return False, value
-
-    if py_type is float:
-        try:
-            return True, float(value)
-        except Exception:
-            return False, value
-
-    if py_type is str:
-        try:
-            return True, str(value)
-        except Exception:
-            return False, value
-
-    # Fallback: no coercion
-    return isinstance(value, py_type), value
-
-
-def _is_timestamp_like(s: str) -> bool:
-    if s.strip().lower() == "now()":
-        return True
-    try:
-        # Loose ISO-8601 acceptance
-        datetime.fromisoformat(s.replace("Z", "+00:00"))
-        return True
-    except Exception:
-        return False
+    @staticmethod
+    def parse(type_str: str) -> "NebulaType":
+        m = re.match(r"^\s*([A-Z_]+)\s*(?:\(\s*(\d+)\s*\))?\s*$", type_str)
+        if not m:
+            raise SchemaError(f"Unrecognized type string: {type_str}")
+        base, arg = m.group(1), m.group(2)
+        return NebulaType(base=base.upper(), arg=int(arg) if arg else None)
 
 
 @dataclass
-class PropertySpec:
+class PropertyDef:
     name: str
-    nebula_base: str
-    max_len: Optional[int]
-    py_type: type | tuple[type, ...]
-    nullable: bool
-    has_default: bool
-    default: Any
+    nebula_type: NebulaType
+    nullable: bool = True
+    default: t.Any = None
     comment: str = ""
 
-    def check_value(self, value: Any, *, coerce: bool) -> Tuple[bool, Any, Optional[str]]:
-        """Validate and optionally coerce a single property value."""
-        # Null handling
-        if value is None:
-            if not self.nullable and not self.has_default:
-                return False, value, "None not allowed"
-            return True, value, None
 
-        # Type checks + coercion
-        ok, new_val = _coerce(value, self.py_type) if coerce else (isinstance(value, self.py_type), value)
-        if not ok:
-            pyname = (
-                "/".join(t.__name__ for t in self.py_type)  # type: ignore
-                if isinstance(self.py_type, tuple) else self.py_type.__name__
-            )
-            return False, value, f"expected {pyname}, got {type(value).__name__}"
-
-        # Extra semantics
-        if self.nebula_base == "FIXED_STRING" and isinstance(new_val, str) and self.max_len is not None:
-            if len(new_val) > self.max_len:
-                return False, new_val, f"exceeds FIXED_STRING({self.max_len}) length"
-        if self.nebula_base == "TIMESTAMP":
-            # Allow "now()", ISO strings, or numeric epoch (already coerced above)
-            if isinstance(new_val, str) and not _is_timestamp_like(new_val):
-                return False, new_val, "invalid timestamp format"
-        return True, new_val, None
+@dataclass
+class TagDef:
+    name: str
+    properties: t.Dict[str, PropertyDef] = field(default_factory=dict)
 
 
-class TomlSchema:
-    def __init__(self, *, raw: dict):
-        self.raw = raw
-        self.space = raw.get("space", {}) or {}
-        self.tags = (raw.get("tags", {}) or {})
-        self.edges = (raw.get("edges", {}) or {})
-        self.rules = (raw.get("validation", {}).get("rules", {}) if raw.get("validation") else {}) or {}
-        self._vid_len_from_space = self._infer_vid_len(self.space.get("vid_type"))
+@dataclass
+class EdgeDef:
+    name: str
+    properties: t.Dict[str, PropertyDef] = field(default_factory=dict)
 
-        # Pre-compile property specs for quick access
-        self._tag_specs: Dict[str, Dict[str, PropertySpec]] = self._build_specs(self.tags)
-        self._edge_specs: Dict[str, Dict[str, PropertySpec]] = self._build_specs(self.edges)
 
-    # ---------- Construction ----------
-    @classmethod
-    def from_toml(cls, path: str | pathlib.Path) -> "TomlSchema":
-        if _load_toml is None:
-            raise RuntimeError("No TOML parser available. Use Python 3.11+ or install 'tomli'.")
-        text = pathlib.Path(path).read_text(encoding="utf-8")
-        raw = _load_toml(text.encode("utf-8"))
-        return cls(raw=raw)
+@dataclass
+class SpaceDef:
+    name: str
+    vid_type: NebulaType
+    partition_num: int
+    replica_factor: int
 
-    # ---------- Internal helpers ----------
-    @staticmethod
-    def _infer_vid_len(vid_type: Optional[str]) -> Optional[int]:
-        if not vid_type or not isinstance(vid_type, str):
-            return None
-        m = _FIXSTR_RE.match(vid_type.strip().upper())
-        if m:
-            return int(m.group(1))
-        return None
+
+@dataclass
+class ValidationRules:
+    require_non_empty_name: bool = False
+    require_semver_version: bool = False
+    allowed_types: t.Optional[t.List[str]] = None
+    enforce_vid_length: t.Optional[int] = None
+
+
+# =============================
+# Schema Registry
+# =============================
+
+class SchemaRegistry:
+    def __init__(self, toml_doc: dict):
+        self._doc = toml_doc
+        self.space = self._parse_space(toml_doc.get("space", {}))
+        self.tags = self._parse_tags(toml_doc.get("tags", {}))
+        self.edges = self._parse_edges(toml_doc.get("edges", {}))
+        self.rules = self._parse_validation_rules(toml_doc.get("validation", {}).get("rules", {}))
 
     @staticmethod
-    def _build_specs(section: dict) -> Dict[str, Dict[str, PropertySpec]]:
-        compiled: Dict[str, Dict[str, PropertySpec]] = {}
-        for label, defn in (section or {}).items():
-            props = defn.get("properties", {}) or {}
-            specmap: Dict[str, PropertySpec] = {}
-            for pname, meta in props.items():
-                nebula_base, max_len, py_type = _parse_nebula_type(str(meta.get("type", "STRING")))
-                nullable = bool(meta.get("nullable", False))
-                has_default = "default" in meta
-                default = meta.get("default")
-                comment = str(meta.get("comment", "")) if meta.get("comment") is not None else ""
-                specmap[pname] = PropertySpec(
+    def load_from_toml(path: str) -> "SchemaRegistry":
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+        return SchemaRegistry(data)
+
+    def _parse_space(self, space: dict) -> SpaceDef:
+        name = space.get("name")
+        if not name:
+            raise SchemaError("Space.name is required")
+        vid_type = NebulaType.parse(space.get("vid_type", "FIXED_STRING(64)"))
+        return SpaceDef(
+            name=name,
+            vid_type=vid_type,
+            partition_num=int(space.get("partition_num", 100)),
+            replica_factor=int(space.get("replica_factor", 1)),
+        )
+
+    def _parse_tags(self, tags: dict) -> t.Dict[str, TagDef]:
+        out: t.Dict[str, TagDef] = {}
+        for tag_name, tag_block in tags.items():
+            props = {}
+            pblock = tag_block.get("properties", {})
+            for pname, pconfig in pblock.items():
+                nebula_type = NebulaType.parse(pconfig["type"])
+                props[pname] = PropertyDef(
                     name=pname,
-                    nebula_base=nebula_base,
-                    max_len=max_len,
-                    py_type=py_type,
-                    nullable=nullable,
-                    has_default=has_default,
-                    default=default,
-                    comment=comment,
+                    nebula_type=nebula_type,
+                    nullable=bool(pconfig.get("nullable", True)),
+                    default=pconfig.get("default", None),
+                    comment=pconfig.get("comment", ""),
                 )
-            compiled[label] = specmap
-        return compiled
-
-    def _props(self, kind: str, label: str) -> Dict[str, PropertySpec]:
-        if kind == "tag":
-            if label not in self._tag_specs:
-                raise KeyError(f"Unknown tag '{label}'")
-            return self._tag_specs[label]
-        if kind == "edge":
-            if label not in self._edge_specs:
-                raise KeyError(f"Unknown edge '{label}'")
-            return self._edge_specs[label]
-        raise ValueError("kind must be 'tag' or 'edge'")
-
-    # ---------- Public helpers ----------
-    def template(self, kind: str, label: str) -> Dict[str, Any]:
-        """Return a dict with keys for all properties and defaulted values (None if no default)."""
-        out = {}
-        for k, spec in self._props(kind, label).items():
-            out[k] = spec.default if spec.has_default else None
+            out[tag_name] = TagDef(name=tag_name, properties=props)
         return out
 
-    def validate(
-        self,
-        *,
-        kind: str,                  # 'tag' | 'edge'
-        label: str,
-        payload: Dict[str, Any],
-        allow_extra: bool = False,
-        coerce: bool = True,
-        apply_defaults: bool = False,
-    ) -> Tuple[bool, Dict[str, str], Dict[str, Any]]:
-        """
-        Validate a payload for a given tag/edge.
+    def _parse_edges(self, edges: dict) -> t.Dict[str, EdgeDef]:
+        out: t.Dict[str, EdgeDef] = {}
+        for edge_name, edge_block in edges.items():
+            pblock = edge_block.get("properties", {}) or {}
+            props = {}
+            for pname, pconfig in pblock.items():
+                nebula_type = NebulaType.parse(pconfig["type"])
+                props[pname] = PropertyDef(
+                    name=pname,
+                    nebula_type=nebula_type,
+                    nullable=bool(pconfig.get("nullable", True)),
+                    default=pconfig.get("default", None),
+                    comment=pconfig.get("comment", ""),
+                )
+            out[edge_name] = EdgeDef(name=edge_name, properties=props)
+        return out
 
-        Returns: (ok, errors, fixed_payload)
-          - ok: True if no errors
-          - errors: field->message
-          - fixed_payload: possibly coerced & default-applied payload (copy)
-        """
-        props = self._props(kind, label)
-        errors: Dict[str, str] = {}
-        fixed = dict(payload)  # work on a copy
+    def _parse_validation_rules(self, rules: dict) -> ValidationRules:
+        return ValidationRules(
+            require_non_empty_name=bool(rules.get("require_non_empty_name", False)),
+            require_semver_version=bool(rules.get("require_semver_version", False)),
+            allowed_types=rules.get("allowed_types"),
+            enforce_vid_length=rules.get("enforce_vid_length"),
+        )
 
-        # Required / defaults
-        for name, spec in props.items():
-            if name not in fixed:
-                if apply_defaults and spec.has_default:
-                    fixed[name] = spec.default
-                elif not spec.nullable and not spec.has_default:
-                    errors[name] = "missing required field"
 
-        # Unknown fields
-        if not allow_extra:
-            for k in list(fixed.keys()):
-                if k not in props:
-                    errors[k] = "unknown field"
+# =============================
+# Literal quoting helpers
+# =============================
 
-        # Per-field type/semantics
-        for name, value in list(fixed.items()):
-            spec = props.get(name)
-            if not spec:
-                continue
-            ok, new_val, err = spec.check_value(value, coerce=coerce)
-            if not ok and err:
-                errors[name] = err
+def _escape_str(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+def qstr(value: str) -> str:
+    return f"\"{_escape_str(value)}\""
+
+def qbool(value: bool) -> str:
+    return "true" if value else "false"
+
+def qnum(value: t.Union[int, float]) -> str:
+    return str(value)
+
+def qtimestamp(value: t.Union[int, str]) -> str:
+    if isinstance(value, str) and value.strip().lower() == "now()":
+        return "now()"
+    return str(int(value))
+
+
+# =============================
+# Coercion helpers
+# =============================
+
+SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z\.-]+)?$")
+
+def _to_bool(v: t.Any) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("true", "t", "yes", "y", "1"):
+            return True
+        if s in ("false", "f", "no", "n", "0"):
+            return False
+    raise ValidationError(f"Cannot coerce {v!r} to BOOL")
+
+def _to_int(v: t.Any) -> int:
+    if isinstance(v, bool):
+        return int(v)
+    if isinstance(v, (int, float)) and int(v) == v:
+        return int(v)
+    if isinstance(v, str) and v.strip().isdigit():
+        return int(v.strip())
+    raise ValidationError(f"Cannot coerce {v!r} to INT")
+
+def _to_float(v: t.Any) -> float:
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        return float(v.strip())
+    raise ValidationError(f"Cannot coerce {v!r} to FLOAT")
+
+def _to_timestamp(v: t.Any) -> t.Union[int, str]:
+    if isinstance(v, str):
+        s = v.strip()
+        if s.lower() == "now()":
+            return "now()"
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            return int(dt.timestamp())
+        except Exception:
+            pass
+        if s.isdigit():
+            return int(s)
+        raise ValidationError(f"Cannot parse TIMESTAMP from {v!r}")
+    if isinstance(v, (int, float)):
+        return int(v)
+    raise ValidationError(f"Cannot coerce {v!r} to TIMESTAMP")
+
+def _to_string(v: t.Any) -> str:
+    if v is None:
+        return ""
+    return str(v)
+
+
+# =============================
+# Validator
+# =============================
+
+@dataclass
+class ValidatorConfig:
+    truncate_fixed_string: bool = False
+    allow_extra_props: bool = False
+    apply_defaults: bool = True
+    strict_nulls: bool = True
+    enforce_vid_length: bool = True
+
+class PayloadValidator:
+    def __init__(self, registry: SchemaRegistry, config: ValidatorConfig | None = None):
+        self.reg = registry
+        self.cfg = config or ValidatorConfig()
+
+    def validate_vertex(self, tag: str, vid: str, props: dict) -> t.Tuple[t.List[str], t.List[t.Any]]:
+        tagdef = self._get_tag(tag)
+        vid = self._validate_vid(vid)
+
+        normalized: dict = {}
+        for pname, pdef in tagdef.properties.items():
+            if pname in props:
+                raw = props[pname]
             else:
-                fixed[name] = new_val
+                if self.cfg.apply_defaults and pdef.default is not None:
+                    raw = pdef.default
+                else:
+                    raw = None
 
-        # Project-level rules
-        self._apply_rules(label=label, kind=kind, payload=fixed, errors=errors)
+            if raw is None:
+                if not pdef.nullable and self.cfg.strict_nulls:
+                    raise ValidationError(f"Missing non-nullable property '{pname}' for tag {tag}")
+                normalized[pname] = None
+                continue
 
-        return len(errors) == 0, errors, fixed
+            normalized[pname] = self._coerce_property(pdef, raw)
 
-    def validate_vid(self, vid: Any) -> Tuple[bool, Optional[str]]:
-        """Validate a VID according to vid_type and validation.rules.enforce_vid_length."""
-        # Only enforce for string VIDs and known length limits.
-        if vid is None:
-            return False, "VID is required"
+        if not self.cfg.allow_extra_props:
+            extra = [k for k in props.keys() if k not in tagdef.properties]
+            if extra:
+                raise ValidationError(f"Unknown properties for tag {tag}: {extra}")
+
+        self._apply_custom_rules(tag, normalized)
+
+        ordered_names = list(tagdef.properties.keys())
+        ordered_values = [normalized[name] for name in ordered_names]
+        return ordered_names, ordered_values
+
+    def validate_edge(self, edge: str, src_vid: str, dst_vid: str, props: dict | None = None, rank: t.Optional[int] = None) -> t.Tuple[t.List[str], t.List[t.Any], t.Optional[int]]:
+        edef = self._get_edge(edge)
+        src = self._validate_vid(src_vid)
+        dst = self._validate_vid(dst_vid)
+
+        normalized: dict = {}
+        props = props or {}
+        for pname, pdef in edef.properties.items():
+            if pname in props:
+                raw = props[pname]
+            else:
+                if self.cfg.apply_defaults and pdef.default is not None:
+                    raw = pdef.default
+                else:
+                    raw = None
+
+            if raw is None:
+                if not pdef.nullable and self.cfg.strict_nulls:
+                    raise ValidationError(f"Missing non-nullable edge property '{pname}' for edge {edge}")
+                normalized[pname] = None
+                continue
+
+            normalized[pname] = self._coerce_property(pdef, raw)
+
+        if not self.cfg.allow_extra_props:
+            extra = [k for k in props.keys() if k not in edef.properties]
+            if extra:
+                raise ValidationError(f"Unknown properties for edge {edge}: {extra}")
+
+        ordered_names = list(edef.properties.keys())
+        ordered_values = [normalized[name] for name in ordered_names]
+        return ordered_names, ordered_values, rank
+
+    # helpers
+    def _get_tag(self, tag: str) -> TagDef:
+        if tag not in self.reg.tags:
+            raise SchemaError(f"Tag not found in schema: {tag}")
+        return self.reg.tags[tag]
+
+    def _get_edge(self, edge: str) -> EdgeDef:
+        if edge not in self.reg.edges:
+            raise SchemaError(f"Edge not found in schema: {edge}")
+        return self.reg.edges[edge]
+
+    def _validate_vid(self, vid: str) -> str:
         if not isinstance(vid, str):
-            return False, "VID must be a string"
+            raise ValidationError("VID must be a string for FIXED_STRING vid spaces")
+        if self.cfg.enforce_vid_length and self.reg.space.vid_type.base == "FIXED_STRING":
+            maxlen = self.reg.space.vid_type.arg or 0
+            if len(vid) > maxlen:
+                raise ValidationError(f"VID length {len(vid)} exceeds FIXED_STRING({maxlen})")
+        return vid
 
-        limit = None
-        # First preference: explicit rule
-        if isinstance(self.rules.get("enforce_vid_length"), int):
-            limit = int(self.rules["enforce_vid_length"])
-        # Otherwise: derive from space.vid_type
-        if limit is None:
-            limit = self._vid_len_from_space
+    def _coerce_property(self, pdef: PropertyDef, raw: t.Any) -> t.Any:
+        base = pdef.nebula_type.base
+        if base in ("STRING", "FIXED_STRING"):
+            s = _to_string(raw)
+            if pdef.nebula_type.base == "FIXED_STRING" and pdef.nebula_type.arg:
+                maxlen = pdef.nebula_type.arg
+                if len(s) > maxlen:
+                    if self.cfg.truncate_fixed_string:
+                        s = s[:maxlen]
+                    else:
+                        raise ValidationError(f"Value for {pdef.name!r} exceeds FIXED_STRING({maxlen})")
+            return s
+        if base in ("BOOL",):
+            return _to_bool(raw)
+        if base in ("INT", "INT8", "INT16", "INT32", "INT64"):
+            return _to_int(raw)
+        if base in ("FLOAT", "DOUBLE"):
+            return _to_float(raw)
+        if base in ("TIMESTAMP",):
+            return _to_timestamp(raw)
+        # default: string
+        return _to_string(raw)
 
-        if isinstance(limit, int):
-            if len(vid) > limit:
-                return False, f"VID exceeds FIXED_STRING({limit}) length"
-        return True, None
+    def _apply_custom_rules(self, tag: str, normalized: dict) -> None:
+        rules = self.reg.rules
+        if rules.require_non_empty_name and "name" in normalized:
+            if normalized["name"] is None or str(normalized["name"]).strip() == "":
+                raise ValidationError(f"Property 'name' must be non-empty for tag {tag}")
+        if rules.require_semver_version and "version_number" in normalized:
+            v = normalized["version_number"]
+            if v is not None and not SEMVER_RE.match(str(v)):
+                raise ValidationError(f"'version_number' must be semver-like (e.g., 1.2.3); got {v!r}")
+        if rules.allowed_types and "type" in normalized and normalized["type"] is not None:
+            if str(normalized["type"]).lower() not in set(x.lower() for x in rules.allowed_types):
+                raise ValidationError(f"Property 'type' value {normalized['type']!r} not in allowed_types {rules.allowed_types}")
 
-    # ---------- Rule enforcements ----------
-    def _apply_rules(self, *, label: str, kind: str, payload: Dict[str, Any], errors: Dict[str, str]) -> None:
-        rules = self.rules or {}
 
-        # require_non_empty_name
-        if rules.get("require_non_empty_name"):
-            if "name" in payload:
-                v = payload.get("name")
-                if v is None or (isinstance(v, str) and len(v.strip()) == 0):
-                    errors["name"] = "name must be non-empty"
+# =============================
+# nGQL Builders
+# =============================
 
-        # require_semver_version
-        if rules.get("require_semver_version"):
-            if "version_number" in payload and payload.get("version_number") is not None:
-                v = str(payload["version_number"]).strip()
-                if not _SEMVER_RE.match(v):
-                    errors["version_number"] = "version_number must be a semantic version (e.g., 1.2.3)"
+class InsertBuilder:
+    def __init__(self, registry: SchemaRegistry):
+        self.reg = registry
 
-        # allowed_types
-        allowed = rules.get("allowed_types")
-        if isinstance(allowed, list) and "type" in payload and payload.get("type") is not None:
-            tval = str(payload["type"]).strip().lower()
-            allowed_norm = {str(x).strip().lower() for x in allowed}
-            if tval not in allowed_norm:
-                errors["type"] = f"type must be one of {sorted(allowed_norm)}"
+    def _literal(self, val: t.Any, validator: PayloadValidator, entity: str, prop: str) -> str:
+        if val is None:
+            return "NULL"
+        pdef = None
+        if entity in validator.reg.tags:
+            pdef = validator.reg.tags[entity].properties.get(prop)
+        elif entity in validator.reg.edges:
+            pdef = validator.reg.edges[entity].properties.get(prop)
 
-        # (Optional) Custom label-specific constraints can be added here if needed.
+        if pdef is None:
+            # best-effort
+            if isinstance(val, str):
+                return qstr(val)
+            if isinstance(val, bool):
+                return qbool(val)
+            if isinstance(val, (int, float)):
+                return qnum(val)
+            return qstr(str(val))
 
-    # ---------- Utilities ----------
-    @staticmethod
-    def dump_json(obj: Any, path: str | pathlib.Path) -> None:
-        pathlib.Path(path).write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+        base = pdef.nebula_type.base
+        if base in ("STRING", "FIXED_STRING"):
+            return qstr(str(val))
+        if base in ("BOOL",):
+            return qbool(bool(val))
+        if base in ("INT", "INT8", "INT16", "INT32", "INT64"):
+            return qnum(int(val))
+        if base in ("FLOAT", "DOUBLE"):
+            return qnum(float(val))
+        if base in ("TIMESTAMP",):
+            return qtimestamp(val)
+        return qstr(str(val))
+
+    # ---- INSERT VERTEX (batch)
+    def insert_vertex(self, tag: str, rows: t.List[t.Tuple[str, dict]], validator: PayloadValidator) -> str:
+        if not rows:
+            raise ValidationError("No rows supplied for INSERT VERTEX")
+        prop_names, _ = validator.validate_vertex(tag, rows[0][0], rows[0][1])
+        values_chunks = []
+        for vid, props in rows:
+            _, prop_values = validator.validate_vertex(tag, vid, props)
+            lit_values = [self._literal(prop_values[i], validator, tag, prop_names[i]) for i in range(len(prop_names))]
+            values_chunks.append(f'{qstr(vid)}:({", ".join(lit_values)})')
+        return f'INSERT VERTEX {tag}({", ".join(prop_names)}) VALUES ' + ", ".join(values_chunks) + ";"
+
+    # ---- UPSERT VERTEX (single)
+    def upsert_vertex(self, tag: str, vid: str, props: dict, validator: PayloadValidator, when: str | None = None, yield_fields: list[str] | None = None) -> str:
+        prop_names, prop_values = validator.validate_vertex(tag, vid, props)
+        assignments = [f"{tag}.{name} = {self._literal(val, validator, tag, name)}" for name, val in zip(prop_names, prop_values)]
+        q = [f'UPSERT VERTEX ON {tag} {qstr(vid)}', "SET " + ", ".join(assignments)]
+        if when:
+            q.append(f"WHEN {when}")
+        if yield_fields:
+            q.append("YIELD " + ", ".join(yield_fields))
+        return " ".join(q) + ";"
+
+    # ---- INSERT EDGE (batch)
+    def insert_edge(self, edge: str, rows: t.List[t.Tuple[str, str, t.Optional[dict], t.Optional[int]]], validator: PayloadValidator) -> str:
+        if not rows:
+            raise ValidationError("No rows supplied for INSERT EDGE")
+        edef = validator._get_edge(edge)
+        prop_names = list(edef.properties.keys())
+        values_chunks = []
+        for src, dst, props, rank in rows:
+            names, vals, r = validator.validate_edge(edge, src, dst, props or {}, rank)
+            if prop_names:
+                lit_values = [self._literal(vals[i], validator, edge, names[i]) for i in range(len(names))]
+                val_str = f'({", ".join(lit_values)})'
+            else:
+                val_str = "()"
+            rank_str = f"@{r}" if r is not None else ""
+            values_chunks.append(f'{qstr(src)}->{qstr(dst)}{rank_str}:{val_str}')
+        fields_part = f'({", ".join(prop_names)})' if prop_names else "()"
+        return f'INSERT EDGE {edge}{fields_part} VALUES ' + ", ".join(values_chunks) + ";"
+
+    # ---- UPSERT EDGE (single)
+    def upsert_edge(self, edge: str, src: str, dst: str, props: dict | None, validator: PayloadValidator, rank: int | None = None, when: str | None = None, yield_fields: list[str] | None = None) -> str:
+        prop_names, prop_values, _ = validator.validate_edge(edge, src, dst, props or {}, rank)
+        assignments = [f"{edge}.{name} = {self._literal(val, validator, edge, name)}" for name, val in zip(prop_names, prop_values)]
+        srcdst = f"{qstr(src)}->{qstr(dst)}"
+        if rank is not None:
+            srcdst += f"@{rank}"
+        q = [f'UPSERT EDGE ON {edge} {srcdst}']
+        if assignments:
+            q.append("SET " + ", ".join(assignments))
+        if when:
+            q.append(f"WHEN {when}")
+        if yield_fields:
+            q.append("YIELD " + ", ".join(yield_fields))
+        return " ".join(q) + ";"
+
+
+# =============================
+# High-level Facade
+# =============================
+
+class GraphInserter:
+    """
+    Facade to:
+      1) load TOML schema
+      2) validate payloads
+      3) build nGQL for INSERT / UPSERT of vertices & edges
+    """
+    def __init__(self, toml_path: str, config: ValidatorConfig | None = None):
+        self.registry = SchemaRegistry.load_from_toml(toml_path)
+        self.validator = PayloadValidator(self.registry, config=config or ValidatorConfig())
+        self.builder = InsertBuilder(self.registry)
+
+    # Vertex APIs
+    def insert_vertex_batch(self, tag: str, rows: t.List[tuple[str, dict]]) -> str:
+        return self.builder.insert_vertex(tag, rows, self.validator)
+
+    def upsert_vertex(self, tag: str, vid: str, props: dict, when: str | None = None, yield_fields: list[str] | None = None) -> str:
+        return self.builder.upsert_vertex(tag, vid, props, self.validator, when=when, yield_fields=yield_fields)
+
+    # Edge APIs
+    def insert_edge_batch(self, edge: str, rows: t.List[tuple[str, str, t.Optional[dict], t.Optional[int]]]) -> str:
+        return self.builder.insert_edge(edge, rows, self.validator)
+
+    def upsert_edge(self, edge: str, src: str, dst: str, props: dict | None, rank: int | None = None, when: str | None = None, yield_fields: list[str] | None = None) -> str:
+        return self.builder.upsert_edge(edge, src, dst, props, self.validator, rank=rank, when=when, yield_fields=yield_fields)
+
+
+# =============================
+# Example usage (optional)
+# =============================
+
+if __name__ == "__main__":
+    # Adjust TOML path as needed
+    toml_path = "/mnt/data/sample_schemt.toml"
+    gi = GraphInserter(toml_path)
+
+    # Vertex INSERT (batch)
+    vertex_ngql = gi.insert_vertex_batch("Policy", [
+        ("POLICY-0001", {
+            "name": "Data Protection Policy",
+            "type": "policy",
+            "business_scope": "Global",
+            "version_number": "1.0.0",
+            "created_at": "now()",
+            "is_active": True
+        }),
+        ("POLICY-0002", {
+            "name": "Vendor Risk Policy",
+            "type": "policy",
+            "business_scope": "Third-Party",
+            "version_number": "1.0.1",
+            "created_at": int(time.time())
+        }),
+    ])
+    print(vertex_ngql)
+
+    # Vertex UPSERT
+    upsert_ngql = gi.upsert_vertex(
+        "Standard",
+        "STD-0100",
+        {"name": "Access Control Std", "type": "standard", "version_number": "2.0.0", "created_at": "2025-01-01T00:00:00Z"},
+        when='Standard.version_number < "2.0.0"',
+        yield_fields=["Standard.name", "Standard.version_number"]
+    )
+    print(upsert_ngql)
+
+    # Edge INSERT
+    edge_insert_ngql = gi.insert_edge_batch("HasContent", [
+        ("POLICY-0001", "STD-0100", None, None),
+        ("POLICY-0002", "STD-0100", None, None),
+    ])
+    print(edge_insert_ngql)
+
+    # Edge UPSERT
+    edge_upsert_ngql = gi.upsert_edge("ParentDocument", "STD-0100", "POLICY-0001", None)
+    print(edge_upsert_ngql)
