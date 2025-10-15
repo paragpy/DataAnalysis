@@ -429,3 +429,36 @@ class GraphDataValidator:
             tval = str(props["type"]).lower()
             if tval not in [str(x).lower() for x in allowed]:
                 raise ValidationError(f"{ctx}: 'type' must be one of {allowed}, got {props['type']!r}")
+
+
+from generic_validator import GraphSchema, GraphDataValidator, ValidationOptions
+
+schema = GraphSchema.from_toml("sample_schemt.toml")  # your current file
+validator = GraphDataValidator(schema, ValidationOptions(truncate_strings=False))
+
+# Validate a node (aka 'tag' in your file)
+props_in = {
+    "name": "Information Security Policy",
+    "type": "policy",
+    "business_scope": "ISMS",
+    "version_number": "1.0.0",
+    "created_at": "now()",     # will coerce to datetime (UTC)
+    "is_active": True
+}
+clean_node = validator.validate_node_props("Policy", props_in)
+print(clean_node)
+
+# Validate a relationship (aka 'edge' in your file)
+clean_rel = validator.validate_rel_props("HasContent", {})
+print(clean_rel)
+
+# Unified payload (DB-agnostic)
+payload = {
+    "entity": "node",          # 'node' or 'relationship' (also accepts 'tag'/'edge')
+    "type": "Policy",
+    "id": "POLICY-0001",       # optional; enforced by enforce_id_length if set
+    "props": props_in
+}
+clean_payload = validator.validate_payload(payload)
+print(clean_payload)
+
