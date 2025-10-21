@@ -134,8 +134,6 @@ def to_bool(value: Any) -> bool:
 class NebulaType:
     """Represents a NebulaGraph data type."""
     
-    __slots__ = ('base', 'size')
-    
     base: str
     size: int | None = None
     
@@ -256,8 +254,6 @@ class TypeConverter:
 class PropertySpec:
     """Specification for a tag or edge property."""
     
-    __slots__ = ('name', 'nebula_type', 'nullable', 'default', 'comment')
-    
     name: str
     nebula_type: NebulaType
     nullable: bool
@@ -273,8 +269,6 @@ class PropertySpec:
 class TagSpec:
     """Specification for a tag (vertex) type."""
     
-    __slots__ = ('name', 'properties', 'comment')
-    
     name: str
     properties: dict[str, PropertySpec] = field(default_factory=dict)
     comment: str | None = None
@@ -284,8 +278,6 @@ class TagSpec:
 class EdgeSpec:
     """Specification for an edge type."""
     
-    __slots__ = ('name', 'properties', 'comment')
-    
     name: str
     properties: dict[str, PropertySpec] = field(default_factory=dict)
     comment: str | None = None
@@ -294,8 +286,6 @@ class EdgeSpec:
 @dataclass
 class ValidationRules:
     """Domain-specific validation rules."""
-    
-    __slots__ = ('require_non_empty_name', 'require_semver_version', 'allowed_types', 'enforce_vid_length')
     
     require_non_empty_name: bool = False
     require_semver_version: bool = False
@@ -430,8 +420,6 @@ class SchemaRegistry:
 @dataclass
 class ValidatorOptions:
     """Configuration options for validation behavior."""
-    
-    __slots__ = ('truncate_strings', 'forbid_unknown_properties', 'apply_defaults', 'strict_mode')
     
     truncate_strings: bool = False
     forbid_unknown_properties: bool = True
