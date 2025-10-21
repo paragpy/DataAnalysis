@@ -165,10 +165,18 @@ class NebulaType:
 class TypeConverter:
     """Converts Python values to NebulaGraph types with validation."""
     
-    __slots__ = ("truncate_strings",)
+    __slots__ = ("truncate_strings", "output_format")
     
-    def __init__(self, truncate_strings: bool = False):
+    def __init__(self, truncate_strings: bool = False, output_format: str = "nebula"):
+        """
+        Initialize converter.
+        
+        Args:
+            truncate_strings: If True, truncate strings that exceed FIXED_STRING length
+            output_format: 'nebula' for NebulaGraph-compatible output, 'python' for Python objects
+        """
         self.truncate_strings = truncate_strings
+        self.output_format = output_format
     
     def convert(self, value: Any, nebula_type: NebulaType) -> Any:
         """Convert and validate value according to NebulaType."""
@@ -190,15 +198,25 @@ class TypeConverter:
         if base in ("FLOAT", "DOUBLE"):
             return self._convert_float(value)
         
-        # Temporal types
-        if base in ("TIMESTAMP", "DATETIME"):
-            return parse_timestamp(value)
+        # Temporal types - return Unix timestamp for NebulaGraph
+        if base == "TIMESTAMP":
+            dt = parse_timestamp(value)
+            return int(dt.timestamp())
         
+        # DATETIME - return ISO format string
+        if base == "DATETIME":
+            dt = parse_timestamp(value)
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        
+        # DATE - return ISO format string
         if base == "DATE":
-            return parse_date(value)
+            d = parse_date(value)
+            return d.strftime("%Y-%m-%d")
         
+        # TIME - return ISO format string
         if base == "TIME":
-            return parse_time(value)
+            t = parse_time(value)
+            return t.strftime("%H:%M:%S")
         
         raise SchemaError(f"Unsupported type for conversion: {base}")
     
