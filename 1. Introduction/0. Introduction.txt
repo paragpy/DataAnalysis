@@ -116,46 +116,40 @@ def parse_datetime(value: Any) -> datetime:
     raise ValidationError(f"Invalid datetime value: {value!r}")
 
 
-def parse_date(value: Any) -> str:
+def parse_date(value: Any) -> date:
     """
-    Parse date and return as ISO 8601 string for NebulaGraph DATE type.
-    Format: YYYY-MM-DD
+    Parse date and return as date object for NebulaGraph DATE type.
     """
-    if isinstance(value, str):
-        # Validate and normalize the date string
-        try:
-            parsed = datetime.fromisoformat(value.strip()).date()
-            return parsed.isoformat()
-        except ValueError:
-            pass
-    
-    if isinstance(value, date):
-        return value.isoformat()
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
     
     if isinstance(value, datetime):
-        return value.date().isoformat()
+        return value.date()
+    
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.strip()).date()
+        except ValueError:
+            pass
     
     raise ValidationError(f"Invalid date value: {value!r}")
 
 
-def parse_time(value: Any) -> str:
+def parse_time(value: Any) -> time:
     """
-    Parse time and return as ISO 8601 string for NebulaGraph TIME type.
-    Format: HH:MM:SS or HH:MM:SS.ffffff
+    Parse time and return as time object for NebulaGraph TIME type.
     """
-    if isinstance(value, str):
-        # Validate and normalize the time string
-        try:
-            parsed = datetime.fromisoformat(f"2000-01-01T{value.strip()}").time()
-            return parsed.isoformat()
-        except ValueError:
-            pass
-    
     if isinstance(value, time):
-        return value.isoformat()
+        return value
     
     if isinstance(value, datetime):
-        return value.time().isoformat()
+        return value.time()
+    
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(f"2000-01-01T{value.strip()}").time()
+        except ValueError:
+            pass
     
     raise ValidationError(f"Invalid time value: {value!r}")
 
@@ -238,15 +232,20 @@ class TypeConverter:
         if base in ("FLOAT", "DOUBLE"):
             return self._convert_float(value)
         
-        # Temporal types - return datetime object for TIMESTAMP/DATETIME
-        if base in ("TIMESTAMP", "DATETIME"):
+        # Temporal types
+        # TIMESTAMP returns Unix timestamp (integer seconds)
+        if base == "TIMESTAMP":
             return parse_timestamp(value)
         
-        # Return ISO string for DATE
+        # DATETIME returns datetime object
+        if base == "DATETIME":
+            return parse_datetime(value)
+        
+        # DATE returns date object
         if base == "DATE":
             return parse_date(value)
         
-        # Return ISO string for TIME
+        # TIME returns time object
         if base == "TIME":
             return parse_time(value)
         
@@ -700,14 +699,17 @@ class GraphValidator:
         if base in ("FLOAT", "DOUBLE"):
             return 0.0
         
-        if base in ("TIMESTAMP", "DATETIME"):
+        if base == "TIMESTAMP":
+            return int(datetime.now(tz=timezone.utc).timestamp())
+        
+        if base == "DATETIME":
             return datetime.now(tz=timezone.utc)
         
         if base == "DATE":
-            return date.today().isoformat()  # Return ISO string
+            return date.today()
         
         if base == "TIME":
-            return "00:00:00"  # Return ISO string
+            return time(0, 0, 0)
         
         # Fallback: raise error if no suitable default
         raise ValidationError(f"Cannot determine default value for type {nebula_type}")
@@ -794,7 +796,7 @@ def main():
         validated_policy = validator.validate_tag("Policy", policy_data)
         print("✓ Validation successful!")
         print(f"Validated properties: {validated_policy}")
-        print(f"Created at (datetime object): {validated_policy['created_at']}")
+        print(f"Created at (Unix timestamp): {validated_policy['created_at']}")
         print(f"Created at type: {type(validated_policy['created_at'])}")
     except ValidationError as e:
         print(f"✗ Validation failed: {e}")
@@ -836,7 +838,7 @@ def main():
         print(f"Type: {validated_payload['type']}")
         print(f"VID: {validated_payload['vid']}")
         print(f"Properties: {validated_payload['props']}")
-        print(f"Created at (datetime object): {validated_payload['props']['created_at']}")
+        print(f"Created at (Unix timestamp): {validated_payload['props']['created_at']}")
         print(f"Created at type: {type(validated_payload['props']['created_at'])}")
     except ValidationError as e:
         print(f"✗ Validation failed: {e}")
@@ -886,7 +888,7 @@ def main():
         validated = validator.validate_tag("Policy", data_with_none)
         print("✓ Validation successful with None handling!")
         print(f"business_scope (was None): '{validated['business_scope']}'")
-        print(f"created_at (was missing, datetime object): {validated['created_at']}")
+        print(f"created_at (was missing, Unix timestamp): {validated['created_at']}")
         print(f"created_at type: {type(validated['created_at'])}")
         print(f"is_active (was missing): {validated['is_active']}")
     except ValidationError as e:
