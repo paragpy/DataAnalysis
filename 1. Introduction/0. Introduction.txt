@@ -1,464 +1,785 @@
-# generic_validator.py
+"""
+Optimized Graph Schema Validator for NebulaGraph
+Validates and transforms data according to TOML schema definitions.
+"""
 from __future__ import annotations
-from dataclasses import dataclass
-from datetime import datetime, date, time, timezone
-from pathlib import Path
-import re
-import typing as t
 
-# Use stdlib tomllib (3.11+). Fallback to "toml" if needed.
+import re
+from dataclasses import dataclass, field
+from datetime import datetime, timezone, date, time
+from pathlib import Path
+from typing import Any, Literal
+
 try:
-    import tomllib  # type: ignore
-except Exception:  # pragma: no cover
+    import tomllib
+except ImportError:
     import toml as tomllib  # type: ignore
 
 
-# =========================
-# Errors
-# =========================
-class SchemaError(Exception): ...
-class ValidationError(Exception): ...
+# ============================================================================
+# Exceptions
+# ============================================================================
+class SchemaError(Exception):
+    """Raised when schema definition is invalid."""
+    pass
 
 
-# =========================
-# Type mapping (vendor-agnostic)
-# =========================
-@dataclass(frozen=True)
-class GenericType:
-    """Abstract, DB-neutral type with optional constraints."""
-    base: str               # 'string' | 'boolean' | 'integer' | 'number' | 'datetime' | 'date' | 'time'
-    max_len: int | None = None
+class ValidationError(Exception):
+    """Raised when data validation fails."""
+    pass
 
-_VENDOR_TOKEN = re.compile(r"^\s*([A-Z_]+)\s*(?:\(\s*(\d+)\s*\))?\s*$")
 
-def to_generic_type(token: str) -> GenericType:
+# ============================================================================
+# Constants & Utilities
+# ============================================================================
+SEMVER_PATTERN = re.compile(
+    r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:[-+][A-Za-z0-9\.-]+)?$"
+)
+
+FIXED_STRING_PATTERN = re.compile(r"FIXED_STRING\s*\(\s*(\d+)\s*\)", re.IGNORECASE)
+
+# Supported Nebula types
+NEBULA_TYPES = {
+    "STRING", "FIXED_STRING", "BOOL", "INT", "INT8", "INT16", "INT32", "INT64",
+    "FLOAT", "DOUBLE", "TIMESTAMP", "DATETIME", "DATE", "TIME"
+}
+
+
+def parse_timestamp(value: Any) -> datetime:
     """
-    Map vendor tokens (e.g., FIXED_STRING(200), STRING, BOOL, INT64, DOUBLE, TIMESTAMP)
-    into abstract types with constraints.
+    Parse various timestamp formats into timezone-aware datetime.
+    
+    Supports:
+    - datetime objects
+    - Unix timestamps (int/float)
+    - ISO 8601 strings
+    - 'now()' function
     """
-    if not isinstance(token, str):
-        raise SchemaError(f"Type must be string, got {type(token).__name__}")
-
-    tkn = token.strip().upper()
-
-    # Common vendor aliases → generic base
-    if tkn.startswith("FIXED_STRING"):
-        m = _VENDOR_TOKEN.match(tkn)
-        if not m or not m.group(2):
-            raise SchemaError(f"Invalid FIXED_STRING spec: {token!r}")
-        return GenericType(base="string", max_len=int(m.group(2)))
-
-    if tkn in {"STRING", "TEXT", "VARCHAR"}:
-        return GenericType(base="string", max_len=None)
-
-    if tkn in {"BOOL", "BOOLEAN"}:
-        return GenericType(base="boolean")
-
-    if tkn in {"INT", "INT8", "INT16", "INT32", "INT64", "INTEGER"}:
-        return GenericType(base="integer")
-
-    if tkn in {"FLOAT", "DOUBLE", "DECIMAL", "NUMERIC"}:
-        return GenericType(base="number")
-
-    if tkn in {"TIMESTAMP", "DATETIME", "ZONED_DATETIME"}:
-        return GenericType(base="datetime")
-
-    if tkn in {"DATE"}:
-        return GenericType(base="date")
-
-    if tkn in {"TIME"}:
-        return GenericType(base="time")
-
-    # Fallback: treat as string (safest neutral default)
-    return GenericType(base="string")
-
-
-# =========================
-# Conversions
-# =========================
-_SEMVER_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:[-+][A-Za-z0-9\.-]+)?$")
-
-def _parse_datetime(val: t.Any) -> datetime:
-    if isinstance(val, datetime):
-        return val.astimezone(timezone.utc)
-    if isinstance(val, (int, float)):
-        return datetime.fromtimestamp(float(val), tz=timezone.utc)
-    if isinstance(val, str):
-        s = val.strip().lower()
-        if s in {"now", "now()"}:
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value, tz=timezone.utc)
+    
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        
+        # Handle 'now()' function
+        if normalized in ("now()", "now"):
             return datetime.now(tz=timezone.utc)
+        
+        # Parse ISO 8601
         try:
-            # supports "...Z"
-            return datetime.fromisoformat(val.replace("Z", "+00:00")).astimezone(timezone.utc)
-        except Exception:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except ValueError:
             pass
-    raise ValidationError(f"Invalid datetime: {val!r}")
+    
+    raise ValidationError(f"Invalid timestamp value: {value!r}")
 
-def _parse_date(val: t.Any) -> date:
-    if isinstance(val, date) and not isinstance(val, datetime):
-        return val
-    if isinstance(val, str):
+
+def parse_date(value: Any) -> date:
+    """Parse date from string or date object."""
+    if isinstance(value, date):
+        return value
+    
+    if isinstance(value, datetime):
+        return value.date()
+    
+    if isinstance(value, str):
         try:
-            return date.fromisoformat(val)
-        except Exception:
+            return datetime.fromisoformat(value.strip()).date()
+        except ValueError:
             pass
-    raise ValidationError(f"Invalid date (YYYY-MM-DD): {val!r}")
+    
+    raise ValidationError(f"Invalid date value: {value!r}")
 
-def _parse_time(val: t.Any) -> time:
-    if isinstance(val, time):
-        return val
-    if isinstance(val, str):
+
+def parse_time(value: Any) -> time:
+    """Parse time from string or time object."""
+    if isinstance(value, time):
+        return value
+    
+    if isinstance(value, datetime):
+        return value.time()
+    
+    if isinstance(value, str):
         try:
-            return time.fromisoformat(val)
-        except Exception:
+            return datetime.fromisoformat(f"2000-01-01T{value.strip()}").time()
+        except ValueError:
             pass
-    raise ValidationError(f"Invalid time (HH:MM[:SS[.ffffff]]): {val!r}")
+    
+    raise ValidationError(f"Invalid time value: {value!r}")
 
-def _to_bool(v: t.Any) -> bool:
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, (int, float)):
-        return v != 0
-    if isinstance(v, str):
-        return v.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
-    raise ValidationError(f"Invalid boolean: {v!r}")
 
-def coerce_value(val: t.Any, gtype: GenericType, *, truncate: bool = False) -> t.Any:
-    b = gtype.base
-    if b == "string":
-        s = "" if val is None else str(val)
-        if gtype.max_len is not None and len(s) > gtype.max_len:
-            if truncate:
-                return s[:gtype.max_len]
-            raise ValidationError(f"String exceeds max_len {gtype.max_len}: {s!r}")
-        return s
+def to_bool(value: Any) -> bool:
+    """Convert various types to boolean."""
+    if isinstance(value, bool):
+        return value
+    
+    if isinstance(value, (int, float)):
+        return value != 0
+    
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        return normalized in {"1", "true", "t", "yes", "y", "on"}
+    
+    raise ValidationError(f"Invalid boolean value: {value!r}")
 
-    if b == "boolean":
-        return _to_bool(val)
 
-    if b == "integer":
+# ============================================================================
+# Type System
+# ============================================================================
+@dataclass(frozen=True, slots=True)
+class NebulaType:
+    """Represents a NebulaGraph data type."""
+    
+    base: str
+    size: int | None = None
+    
+    @classmethod
+    def parse(cls, type_str: str) -> NebulaType:
+        """Parse type string into NebulaType object."""
+        normalized = type_str.strip().upper()
+        
+        # Handle FIXED_STRING(N)
+        if normalized.startswith("FIXED_STRING"):
+            match = FIXED_STRING_PATTERN.search(normalized)
+            if not match:
+                raise SchemaError(f"Invalid FIXED_STRING specification: {type_str}")
+            return cls(base="FIXED_STRING", size=int(match.group(1)))
+        
+        # Validate base type
+        if normalized not in NEBULA_TYPES:
+            raise SchemaError(f"Unsupported type: {type_str}")
+        
+        return cls(base=normalized)
+    
+    def __str__(self) -> str:
+        return f"{self.base}({self.size})" if self.size else self.base
+
+
+# ============================================================================
+# Type Converter
+# ============================================================================
+class TypeConverter:
+    """Converts Python values to NebulaGraph types with validation."""
+    
+    __slots__ = ("truncate_strings",)
+    
+    def __init__(self, truncate_strings: bool = False):
+        self.truncate_strings = truncate_strings
+    
+    def convert(self, value: Any, nebula_type: NebulaType) -> Any:
+        """Convert and validate value according to NebulaType."""
+        base = nebula_type.base
+        
+        # String types
+        if base in ("STRING", "FIXED_STRING"):
+            return self._convert_string(value, nebula_type)
+        
+        # Boolean
+        if base == "BOOL":
+            return to_bool(value)
+        
+        # Integer types
+        if base in ("INT", "INT8", "INT16", "INT32", "INT64"):
+            return self._convert_int(value, base)
+        
+        # Float types
+        if base in ("FLOAT", "DOUBLE"):
+            return self._convert_float(value)
+        
+        # Temporal types
+        if base in ("TIMESTAMP", "DATETIME"):
+            return parse_timestamp(value)
+        
+        if base == "DATE":
+            return parse_date(value)
+        
+        if base == "TIME":
+            return parse_time(value)
+        
+        raise SchemaError(f"Unsupported type for conversion: {base}")
+    
+    def _convert_string(self, value: Any, nebula_type: NebulaType) -> str:
+        """Convert to string with optional length validation."""
+        string_val = "" if value is None else str(value)
+        
+        if nebula_type.base == "FIXED_STRING" and nebula_type.size:
+            max_len = nebula_type.size
+            if len(string_val) > max_len:
+                if self.truncate_strings:
+                    return string_val[:max_len]
+                raise ValidationError(
+                    f"String length {len(string_val)} exceeds FIXED_STRING({max_len}) limit"
+                )
+        
+        return string_val
+    
+    def _convert_int(self, value: Any, type_name: str) -> int:
+        """Convert to integer with range validation."""
         try:
-            return int(val)
-        except Exception:
-            raise ValidationError(f"Invalid integer: {val!r}")
-
-    if b == "number":
+            int_val = int(value)
+        except (ValueError, TypeError):
+            raise ValidationError(f"Cannot convert {value!r} to integer")
+        
+        # Validate range based on type
+        ranges = {
+            "INT8": (-128, 127),
+            "INT16": (-32768, 32767),
+            "INT32": (-2147483648, 2147483647),
+            "INT64": (-9223372036854775808, 9223372036854775807),
+        }
+        
+        if type_name in ranges:
+            min_val, max_val = ranges[type_name]
+            if not (min_val <= int_val <= max_val):
+                raise ValidationError(f"Value {int_val} out of range for {type_name}")
+        
+        return int_val
+    
+    def _convert_float(self, value: Any) -> float:
+        """Convert to float."""
         try:
-            return float(val)
-        except Exception:
-            raise ValidationError(f"Invalid number: {val!r}")
-
-    if b == "datetime":
-        return _parse_datetime(val)
-
-    if b == "date":
-        return _parse_date(val)
-
-    if b == "time":
-        return _parse_time(val)
-
-    # default: string
-    return str(val)
+            return float(value)
+        except (ValueError, TypeError):
+            raise ValidationError(f"Cannot convert {value!r} to float")
 
 
-# =========================
-# Schema registry (generic)
-# =========================
-@dataclass
+# ============================================================================
+# Schema Specifications
+# ============================================================================
+@dataclass(slots=True)
 class PropertySpec:
+    """Specification for a tag or edge property."""
+    
     name: str
-    gtype: GenericType
+    nebula_type: NebulaType
     nullable: bool
-    default: t.Any | None = None
+    default: Any | None
     comment: str | None = None
-    regex: str | None = None          # optional additional constraint (generic)
-    min_len: int | None = None        # optional
-    max_len: int | None = None        # optional; overrides gtype.max_len if smaller
-    choices: list[str] | None = None  # optional enum/choice list
+    
+    def has_default(self) -> bool:
+        """Check if property has a default value."""
+        return self.default is not None
 
-@dataclass
-class NodeType:
+
+@dataclass(slots=True)
+class TagSpec:
+    """Specification for a tag (vertex) type."""
+    
     name: str
-    properties: dict[str, PropertySpec]
+    properties: dict[str, PropertySpec] = field(default_factory=dict)
+    comment: str | None = None
 
-@dataclass
-class RelType:
+
+@dataclass(slots=True)
+class EdgeSpec:
+    """Specification for an edge type."""
+    
     name: str
-    properties: dict[str, PropertySpec]  # may be empty
+    properties: dict[str, PropertySpec] = field(default_factory=dict)
+    comment: str | None = None
 
-class GraphSchema:
+
+@dataclass(slots=True)
+class ValidationRules:
+    """Domain-specific validation rules."""
+    
+    require_non_empty_name: bool = False
+    require_semver_version: bool = False
+    allowed_types: list[str] | None = None
+    enforce_vid_length: int | None = None
+
+
+# ============================================================================
+# Schema Registry
+# ============================================================================
+class SchemaRegistry:
     """
-    Reads a TOML schema and exposes generic Node/Relationship types.
-    Works with keys named 'tags'/'edges' (your current file) OR 'nodes'/'relationships'.
+    Registry of graph schema definitions loaded from TOML.
+    
+    Provides fast lookup for tags, edges, and validation rules.
     """
-    def __init__(self, raw: dict):
-        self._raw = raw
-        self.nodes: dict[str, NodeType] = {}
-        self.rels: dict[str, RelType] = {}
-
-        # Domain-level rules (generic)
-        self.rules = {
-            "require_non_empty_name": False,
-            "require_semver_version": False,
-            "allowed_types": None,           # enum for 'type' property values
-            "enforce_id_length": None,       # generic name
-            "enforce_vid_length": None,      # kept for backward compatibility
-        }
-        self._load()
-
-    @staticmethod
-    def from_toml(path_or_str: str | Path) -> "GraphSchema":
-        p = Path(path_or_str)
-        data = tomllib.load(p.open("rb")) if p.exists() else tomllib.loads(str(path_or_str))
-        return GraphSchema(data)
-
-    def _collect_entity_block(self, primary_key: str, fallback_key: str) -> dict:
-        block = self._raw.get(primary_key)
-        if block is None:
-            block = self._raw.get(fallback_key, {})
-        return block or {}
-
-    def _load(self):
-        # Nodes: prefer 'tags', fallback 'nodes'
-        raw_nodes = self._collect_entity_block("tags", "nodes")
-        for node_name, node_body in raw_nodes.items():
-            ps: dict[str, PropertySpec] = {}
-            for pn, pd in (node_body.get("properties") or {}).items():
-                gtype = to_generic_type(pd["type"])
-                ps[pn] = PropertySpec(
-                    name=pn,
-                    gtype=gtype,
-                    nullable=bool(pd.get("nullable", True)),
-                    default=pd.get("default"),
-                    comment=pd.get("comment"),
-                    # optional generic constraints if present
-                    regex=pd.get("regex"),
-                    min_len=pd.get("min_len"),
-                    max_len=pd.get("max_len"),
-                    choices=pd.get("choices"),
-                )
-            self.nodes[node_name] = NodeType(name=node_name, properties=ps)
-
-        # Relationships: prefer 'edges', fallback 'relationships'
-        raw_rels = self._collect_entity_block("edges", "relationships")
-        for rel_name, rel_body in raw_rels.items():
-            ps: dict[str, PropertySpec] = {}
-            for pn, pd in (rel_body.get("properties") or {}).items():
-                gtype = to_generic_type(pd["type"])
-                ps[pn] = PropertySpec(
-                    name=pn,
-                    gtype=gtype,
-                    nullable=bool(pd.get("nullable", True)),
-                    default=pd.get("default"),
-                    comment=pd.get("comment"),
-                    regex=pd.get("regex"),
-                    min_len=pd.get("min_len"),
-                    max_len=pd.get("max_len"),
-                    choices=pd.get("choices"),
-                )
-            self.rels[rel_name] = RelType(name=rel_name, properties=ps)
-
-        # Generic validation rules block
-        rules = (((self._raw.get("validation") or {}).get("rules")) or {})
-        self.rules["require_non_empty_name"] = bool(rules.get("require_non_empty_name", False))
-        self.rules["require_semver_version"] = bool(rules.get("require_semver_version", False))
-        self.rules["allowed_types"] = rules.get("allowed_types")
-        # accept either enforce_id_length or (legacy) enforce_vid_length
-        self.rules["enforce_id_length"] = rules.get("enforce_id_length", rules.get("enforce_vid_length"))
-
-    def get_node(self, name: str) -> NodeType:
-        try:
-            return self.nodes[name]
-        except KeyError:
-            raise SchemaError(f"Unknown node type: {name}")
-
-    def get_rel(self, name: str) -> RelType:
-        try:
-            return self.rels[name]
-        except KeyError:
-            raise SchemaError(f"Unknown relationship type: {name}")
-
-
-# =========================
-# Validator (generic)
-# =========================
-@dataclass
-class ValidationOptions:
-    truncate_strings: bool = False     # truncate if over max_len
-    forbid_unknown_props: bool = True  # error on extraneous fields
-
-class GraphDataValidator:
-    def __init__(self, schema: GraphSchema, options: ValidationOptions | None = None):
-        self.schema = schema
-        self.options = options or ValidationOptions()
-
-    # ---------- public APIs ----------
-    def validate_node_props(self, node_type: str, props: dict) -> dict:
-        spec = self.schema.get_node(node_type)
-        return self._validate_properties(props, spec.properties, f"Node[{node_type}]")
-
-    def validate_rel_props(self, rel_type: str, props: dict) -> dict:
-        spec = self.schema.get_rel(rel_type)
-        return self._validate_properties(props, spec.properties, f"Relationship[{rel_type}]")
-
-    def validate_id(self, id_value: str | None) -> str | None:
-        if id_value is None:
-            return None
-        s = str(id_value)
-        max_len = self.schema.rules.get("enforce_id_length")
-        if isinstance(max_len, int) and len(s) > max_len:
-            raise ValidationError(f"ID length {len(s)} exceeds enforced limit {max_len}")
-        return s
-
-    def validate_payload(self, payload: dict) -> dict:
+    
+    __slots__ = ("_raw_data", "tags", "edges", "rules", "space_config")
+    
+    def __init__(self, schema_data: dict):
+        self._raw_data = schema_data
+        self.tags: dict[str, TagSpec] = {}
+        self.edges: dict[str, EdgeSpec] = {}
+        self.rules = ValidationRules()
+        self.space_config: dict[str, Any] = {}
+        self._load_schema()
+    
+    @classmethod
+    def from_toml(cls, path_or_content: str | Path) -> SchemaRegistry:
         """
-        Generic unified entry point.
-
-        payload = {
-          "entity": "node" | "tag" | "edge" | "relationship",
-          "type": "Policy" | "HasContent" | ...,
-          "id": "optional id/key for node",         # nodes only (generic)
-          "props": { ... }
-        }
+        Load schema from TOML file or string.
+        
+        Args:
+            path_or_content: File path or TOML content string
+            
+        Returns:
+            SchemaRegistry instance
         """
-        entity = (payload.get("entity") or "").lower()
-        etype  = payload.get("type")
-        props  = payload.get("props") or {}
-        pid    = payload.get("id")
-
-        if entity not in {"node", "tag", "edge", "relationship"}:
-            raise ValidationError("payload.entity must be 'node'/'tag' or 'edge'/'relationship'")
-
-        if not etype or not isinstance(etype, str):
-            raise ValidationError("payload.type must be a non-empty string")
-
-        if entity in {"node", "tag"}:
-            cleaned = self.validate_node_props(etype, props)
-            return {"entity": "node", "type": etype, "id": self.validate_id(pid), "props": cleaned}
-
-        cleaned = self.validate_rel_props(etype, props)
-        return {"entity": "relationship", "type": etype, "props": cleaned}
-
-    # ---------- internals ----------
-    def _validate_properties(self, input_props: dict[str, t.Any], spec_map: dict[str, PropertySpec], ctx: str) -> dict:
-        cleaned: dict[str, t.Any] = {}
-
-        if self.options.forbid_unknown_props:
-            unknown = set(input_props) - set(spec_map)
-            if unknown:
-                raise ValidationError(f"{ctx}: unknown properties: {sorted(unknown)}")
-
-        for name, ps in spec_map.items():
-            present = name in input_props
-            raw = input_props.get(name)
-
-            if not present or raw is None:
-                if ps.default is not None:
-                    val = self._evaluate_default(ps.default, ps)
-                    cleaned[name] = self._coerce(val, ps)
-                elif ps.nullable:
-                    cleaned[name] = None
-                else:
-                    raise ValidationError(f"{ctx}: required non-null property '{name}' missing")
+        path = Path(path_or_content)
+        
+        if path.exists() and path.is_file():
+            with path.open("rb") as f:
+                data = tomllib.load(f)
+        else:
+            # Treat as TOML string content
+            data = tomllib.loads(str(path_or_content))
+        
+        return cls(data)
+    
+    def _load_schema(self):
+        """Load and parse schema from raw TOML data."""
+        # Load space configuration
+        self.space_config = self._raw_data.get("space", {})
+        
+        # Load tags
+        raw_tags = self._raw_data.get("tags", {})
+        for tag_name, tag_data in raw_tags.items():
+            if not isinstance(tag_data, dict):
                 continue
+            
+            properties = self._parse_properties(tag_data.get("properties", {}))
+            self.tags[tag_name] = TagSpec(
+                name=tag_name,
+                properties=properties,
+                comment=tag_data.get("comment")
+            )
+        
+        # Load edges
+        raw_edges = self._raw_data.get("edges", {})
+        for edge_name, edge_data in raw_edges.items():
+            if not isinstance(edge_data, dict):
+                continue
+            
+            properties = self._parse_properties(edge_data.get("properties", {}))
+            self.edges[edge_name] = EdgeSpec(
+                name=edge_name,
+                properties=properties,
+                comment=edge_data.get("comment")
+            )
+        
+        # Load validation rules
+        rules_data = self._raw_data.get("validation", {}).get("rules", {})
+        self.rules = ValidationRules(
+            require_non_empty_name=rules_data.get("require_non_empty_name", False),
+            require_semver_version=rules_data.get("require_semver_version", False),
+            allowed_types=rules_data.get("allowed_types"),
+            enforce_vid_length=rules_data.get("enforce_vid_length")
+        )
+    
+    def _parse_properties(self, props_data: dict) -> dict[str, PropertySpec]:
+        """Parse property specifications from TOML data."""
+        properties = {}
+        
+        for prop_name, prop_data in props_data.items():
+            if not isinstance(prop_data, dict):
+                continue
+            
+            properties[prop_name] = PropertySpec(
+                name=prop_name,
+                nebula_type=NebulaType.parse(prop_data["type"]),
+                nullable=prop_data.get("nullable", True),
+                default=prop_data.get("default"),
+                comment=prop_data.get("comment")
+            )
+        
+        return properties
+    
+    def get_tag(self, name: str) -> TagSpec:
+        """Get tag specification by name."""
+        if name not in self.tags:
+            raise SchemaError(f"Unknown tag type: {name}")
+        return self.tags[name]
+    
+    def get_edge(self, name: str) -> EdgeSpec:
+        """Get edge specification by name."""
+        if name not in self.edges:
+            raise SchemaError(f"Unknown edge type: {name}")
+        return self.edges[name]
+    
+    def has_tag(self, name: str) -> bool:
+        """Check if tag exists in schema."""
+        return name in self.tags
+    
+    def has_edge(self, name: str) -> bool:
+        """Check if edge exists in schema."""
+        return name in self.edges
 
-            cleaned[name] = self._coerce(raw, ps)
 
-            # Extra generic constraints
-            sval = cleaned[name]
-            if ps.regex and sval is not None:
-                if not re.compile(ps.regex).match(str(sval)):
-                    raise ValidationError(f"{ctx}: property '{name}' does not match regex {ps.regex!r}")
+# ============================================================================
+# Validator Options
+# ============================================================================
+@dataclass(slots=True)
+class ValidatorOptions:
+    """Configuration options for validation behavior."""
+    
+    truncate_strings: bool = False
+    forbid_unknown_properties: bool = True
+    apply_defaults: bool = True
+    strict_mode: bool = True
 
-            # min_len/max_len override (for strings)
-            if ps.gtype.base == "string" and sval is not None:
-                s = str(sval)
-                if ps.min_len is not None and len(s) < ps.min_len:
-                    raise ValidationError(f"{ctx}: property '{name}' shorter than min_len {ps.min_len}")
-                # Use the smallest max among type-level and property-level if both present
-                effective_max = min([x for x in [ps.gtype.max_len, ps.max_len] if x is not None], default=None)
-                if effective_max is not None and len(s) > effective_max:
-                    if self.options.truncate_strings:
-                        cleaned[name] = s[:effective_max]
-                    else:
-                        raise ValidationError(f"{ctx}: property '{name}' exceeds max_len {effective_max}")
-            # choices
-            if ps.choices is not None and cleaned[name] is not None:
-                val_norm = str(cleaned[name]).lower()
-                if val_norm not in [str(x).lower() for x in ps.choices]:
-                    raise ValidationError(f"{ctx}: property '{name}' must be one of {ps.choices}, got {cleaned[name]!r}")
 
-        # pass-through unknowns if allowed
-        if not self.options.forbid_unknown_props:
-            for k, v in input_props.items():
-                if k not in cleaned:
-                    cleaned[k] = v
-
-        self._apply_schema_rules(ctx, cleaned)
-        return cleaned
-
-    def _evaluate_default(self, default: t.Any, ps: PropertySpec) -> t.Any:
+# ============================================================================
+# Graph Validator
+# ============================================================================
+class GraphValidator:
+    """
+    Validates and transforms graph data according to schema definitions.
+    
+    Features:
+    - Type conversion and validation
+    - Default value application
+    - Domain rule enforcement
+    - VID validation
+    """
+    
+    __slots__ = ("registry", "options", "converter")
+    
+    def __init__(
+        self,
+        registry: SchemaRegistry,
+        options: ValidatorOptions | None = None
+    ):
+        self.registry = registry
+        self.options = options or ValidatorOptions()
+        self.converter = TypeConverter(truncate_strings=self.options.truncate_strings)
+    
+    # ========================================================================
+    # Public API
+    # ========================================================================
+    
+    def validate_tag(self, tag_name: str, properties: dict[str, Any]) -> dict[str, Any]:
+        """
+        Validate and transform tag properties.
+        
+        Args:
+            tag_name: Name of the tag type
+            properties: Property values to validate
+            
+        Returns:
+            Validated and transformed properties
+        """
+        spec = self.registry.get_tag(tag_name)
+        validated = self._validate_properties(
+            properties,
+            spec.properties,
+            entity_type="Tag",
+            entity_name=tag_name
+        )
+        self._apply_domain_rules(validated, entity_name=f"Tag[{tag_name}]")
+        return validated
+    
+    def validate_edge(self, edge_name: str, properties: dict[str, Any]) -> dict[str, Any]:
+        """
+        Validate and transform edge properties.
+        
+        Args:
+            edge_name: Name of the edge type
+            properties: Property values to validate
+            
+        Returns:
+            Validated and transformed properties
+        """
+        spec = self.registry.get_edge(edge_name)
+        validated = self._validate_properties(
+            properties,
+            spec.properties,
+            entity_type="Edge",
+            entity_name=edge_name
+        )
+        return validated
+    
+    def validate_vid(self, vid: str | None) -> str:
+        """
+        Validate vertex ID according to schema rules.
+        
+        Args:
+            vid: Vertex ID to validate
+            
+        Returns:
+            Validated vertex ID
+        """
+        if vid is None:
+            raise ValidationError("VID cannot be None")
+        
+        vid_str = str(vid).strip()
+        
+        if not vid_str:
+            raise ValidationError("VID cannot be empty")
+        
+        # Check length constraint if defined
+        max_length = self.registry.rules.enforce_vid_length
+        if max_length and len(vid_str) > max_length:
+            raise ValidationError(
+                f"VID length {len(vid_str)} exceeds maximum {max_length}"
+            )
+        
+        return vid_str
+    
+    def validate_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """
+        Validate a complete payload with entity type, properties, and optional VID.
+        
+        Expected payload structure:
+        {
+            "entity": "tag" | "edge",
+            "type": "<tag_name>" | "<edge_name>",
+            "vid": "<vertex_id>",  # for tags only
+            "props": { ... }
+        }
+        
+        Returns:
+            Validated payload with transformed properties
+        """
+        entity = payload.get("entity", "").lower()
+        entity_type = payload.get("type")
+        vid = payload.get("vid")
+        properties = payload.get("props", {})
+        
+        # Validate entity type
+        if entity not in ("tag", "edge"):
+            raise ValidationError("entity must be 'tag' or 'edge'")
+        
+        if not entity_type or not isinstance(entity_type, str):
+            raise ValidationError("type must be a non-empty string")
+        
+        # Validate based on entity type
+        if entity == "tag":
+            validated_vid = self.validate_vid(vid)
+            validated_props = self.validate_tag(entity_type, properties)
+            
+            return {
+                "entity": "tag",
+                "type": entity_type,
+                "vid": validated_vid,
+                "props": validated_props
+            }
+        else:
+            validated_props = self.validate_edge(entity_type, properties)
+            
+            return {
+                "entity": "edge",
+                "type": entity_type,
+                "props": validated_props
+            }
+    
+    # ========================================================================
+    # Internal Implementation
+    # ========================================================================
+    
+    def _validate_properties(
+        self,
+        input_props: dict[str, Any],
+        prop_specs: dict[str, PropertySpec],
+        entity_type: str,
+        entity_name: str
+    ) -> dict[str, Any]:
+        """Core property validation and transformation logic."""
+        validated: dict[str, Any] = {}
+        entity_label = f"{entity_type}[{entity_name}]"
+        
+        # Check for unknown properties
+        if self.options.forbid_unknown_properties:
+            unknown = set(input_props) - set(prop_specs)
+            if unknown:
+                raise ValidationError(
+                    f"{entity_label}: Unknown properties: {', '.join(sorted(unknown))}"
+                )
+        
+        # Process each property in schema
+        for prop_name, spec in prop_specs.items():
+            raw_value = input_props.get(prop_name)
+            has_value = prop_name in input_props
+            
+            # Handle missing or null values
+            if not has_value or raw_value is None:
+                if self.options.apply_defaults and spec.has_default():
+                    default_value = self._resolve_default(spec)
+                    validated[prop_name] = self.converter.convert(default_value, spec.nebula_type)
+                elif spec.nullable:
+                    validated[prop_name] = None
+                else:
+                    raise ValidationError(
+                        f"{entity_label}: Required property '{prop_name}' is missing"
+                    )
+                continue
+            
+            # Convert and validate value
+            try:
+                validated[prop_name] = self.converter.convert(raw_value, spec.nebula_type)
+            except ValidationError as e:
+                raise ValidationError(f"{entity_label}.{prop_name}: {e}") from e
+        
+        # Pass through unknown properties if allowed
+        if not self.options.forbid_unknown_properties:
+            for prop_name, value in input_props.items():
+                if prop_name not in validated:
+                    validated[prop_name] = value
+        
+        return validated
+    
+    def _resolve_default(self, spec: PropertySpec) -> Any:
+        """Resolve default value, handling special functions like now()."""
+        default = spec.default
+        
+        # Handle now() function for temporal types
         if isinstance(default, str):
-            d = default.strip().lower()
-            if d in {"now", "now()"} and ps.gtype.base == "datetime":
-                return datetime.now(tz=timezone.utc)
-            if d in {"today", "today()"} and ps.gtype.base == "date":
-                return date.today()
+            normalized = default.strip().lower()
+            if normalized in ("now()", "now"):
+                if spec.nebula_type.base in ("TIMESTAMP", "DATETIME"):
+                    return datetime.now(tz=timezone.utc)
+        
         return default
+    
+    def _apply_domain_rules(self, properties: dict[str, Any], entity_name: str):
+        """Apply domain-specific validation rules."""
+        rules = self.registry.rules
+        
+        # Rule: non-empty name
+        if rules.require_non_empty_name and "name" in properties:
+            name_value = properties["name"]
+            if name_value is None or str(name_value).strip() == "":
+                raise ValidationError(f"{entity_name}: 'name' cannot be empty")
+        
+        # Rule: semantic versioning
+        if rules.require_semver_version and "version_number" in properties:
+            version = properties["version_number"]
+            if version is not None:
+                version_str = str(version).strip()
+                if not SEMVER_PATTERN.match(version_str):
+                    raise ValidationError(
+                        f"{entity_name}: 'version_number' must follow semantic versioning "
+                        f"(e.g., 1.2.3), got: {version_str!r}"
+                    )
+        
+        # Rule: allowed types
+        if rules.allowed_types and "type" in properties:
+            type_value = properties["type"]
+            if type_value is not None:
+                type_str = str(type_value).lower()
+                allowed_lower = [t.lower() for t in rules.allowed_types]
+                if type_str not in allowed_lower:
+                    raise ValidationError(
+                        f"{entity_name}: 'type' must be one of {rules.allowed_types}, "
+                        f"got: {type_value!r}"
+                    )
 
-    def _coerce(self, value: t.Any, ps: PropertySpec) -> t.Any:
+
+# ============================================================================
+# Example Usage
+# ============================================================================
+def main():
+    """Example usage of the Graph Schema Validator."""
+    
+    # Load schema from TOML file
+    registry = SchemaRegistry.from_toml("sample_schema.toml")
+    
+    # Create validator with options
+    options = ValidatorOptions(
+        truncate_strings=False,
+        forbid_unknown_properties=True,
+        apply_defaults=True
+    )
+    validator = GraphValidator(registry, options)
+    
+    # Example 1: Validate tag properties
+    print("=" * 60)
+    print("Example 1: Validating Policy Tag")
+    print("=" * 60)
+    
+    policy_data = {
+        "name": "Information Security Policy",
+        "type": "policy",
+        "business_scope": "Enterprise-wide ISMS",
+        "version_number": "2.1.0",
+        "created_at": "now()",
+        "is_active": True
+    }
+    
+    try:
+        validated_policy = validator.validate_tag("Policy", policy_data)
+        print("✓ Validation successful!")
+        print(f"Validated properties: {validated_policy}")
+        print(f"Created at (datetime): {validated_policy['created_at']}")
+    except ValidationError as e:
+        print(f"✗ Validation failed: {e}")
+    
+    # Example 2: Validate edge properties
+    print("\n" + "=" * 60)
+    print("Example 2: Validating HasContent Edge")
+    print("=" * 60)
+    
+    try:
+        validated_edge = validator.validate_edge("HasContent", {})
+        print("✓ Validation successful!")
+        print(f"Validated properties: {validated_edge}")
+    except ValidationError as e:
+        print(f"✗ Validation failed: {e}")
+    
+    # Example 3: Validate complete payload
+    print("\n" + "=" * 60)
+    print("Example 3: Validating Complete Payload")
+    print("=" * 60)
+    
+    payload = {
+        "entity": "tag",
+        "type": "Addendum",
+        "vid": "ADDENDUM-2024-001",
+        "props": {
+            "name": "Security Controls Addendum",
+            "type": "addendum",
+            "version_number": "1.0.0",
+            "created_at": 1729468800,  # Unix timestamp
+            "is_active": "yes"  # String that can be converted to bool
+        }
+    }
+    
+    try:
+        validated_payload = validator.validate_payload(payload)
+        print("✓ Validation successful!")
+        print(f"Entity: {validated_payload['entity']}")
+        print(f"Type: {validated_payload['type']}")
+        print(f"VID: {validated_payload['vid']}")
+        print(f"Properties: {validated_payload['props']}")
+        print(f"Created at (datetime): {validated_payload['props']['created_at']}")
+    except ValidationError as e:
+        print(f"✗ Validation failed: {e}")
+    
+    # Example 4: Demonstrate validation errors
+    print("\n" + "=" * 60)
+    print("Example 4: Validation Error Examples")
+    print("=" * 60)
+    
+    invalid_cases = [
+        {
+            "desc": "Invalid semantic version",
+            "data": {"name": "Test", "type": "policy", "version_number": "1.2"}
+        },
+        {
+            "desc": "Missing required property",
+            "data": {"type": "policy"}  # 'name' is required
+        },
+        {
+            "desc": "Invalid type value",
+            "data": {"name": "Test", "type": "invalid_type", "version_number": "1.0.0"}
+        }
+    ]
+    
+    for case in invalid_cases:
         try:
-            return coerce_value(value, ps.gtype, truncate=self.options.truncate_strings)
+            validator.validate_tag("Policy", case["data"])
+            print(f"  {case['desc']}: Unexpectedly passed")
         except ValidationError as e:
-            raise ValidationError(f"Property '{ps.name}': {e}") from e
-
-    # -------- domain-wide rules from [validation.rules] ----------
-    def _apply_schema_rules(self, ctx: str, props: dict):
-        rules = self.schema.rules
-
-        if rules.get("require_non_empty_name") and "name" in props:
-            if props["name"] is None or str(props["name"]).strip() == "":
-                raise ValidationError(f"{ctx}: 'name' cannot be empty")
-
-        if rules.get("require_semver_version") and "version_number" in props and props["version_number"] is not None:
-            if not _SEMVER_RE.match(str(props["version_number"])):
-                raise ValidationError(f"{ctx}: 'version_number' must follow semver (e.g., 1.2.3)")
-
-        allowed = rules.get("allowed_types")
-        if allowed and "type" in props and props["type"] is not None:
-            tval = str(props["type"]).lower()
-            if tval not in [str(x).lower() for x in allowed]:
-                raise ValidationError(f"{ctx}: 'type' must be one of {allowed}, got {props['type']!r}")
+            print(f"  {case['desc']}: ✓ Caught error - {e}")
 
 
-from generic_validator import GraphSchema, GraphDataValidator, ValidationOptions
-
-schema = GraphSchema.from_toml("sample_schemt.toml")  # your current file
-validator = GraphDataValidator(schema, ValidationOptions(truncate_strings=False))
-
-# Validate a node (aka 'tag' in your file)
-props_in = {
-    "name": "Information Security Policy",
-    "type": "policy",
-    "business_scope": "ISMS",
-    "version_number": "1.0.0",
-    "created_at": "now()",     # will coerce to datetime (UTC)
-    "is_active": True
-}
-clean_node = validator.validate_node_props("Policy", props_in)
-print(clean_node)
-
-# Validate a relationship (aka 'edge' in your file)
-clean_rel = validator.validate_rel_props("HasContent", {})
-print(clean_rel)
-
-# Unified payload (DB-agnostic)
-payload = {
-    "entity": "node",          # 'node' or 'relationship' (also accepts 'tag'/'edge')
-    "type": "Policy",
-    "id": "POLICY-0001",       # optional; enforced by enforce_id_length if set
-    "props": props_in
-}
-clean_payload = validator.validate_payload(payload)
-print(clean_payload)
-
+if __name__ == "__main__":
+    main()
