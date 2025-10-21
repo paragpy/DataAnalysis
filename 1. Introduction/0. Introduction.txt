@@ -10,10 +10,7 @@ from datetime import datetime, timezone, date, time
 from pathlib import Path
 from typing import Any, Literal
 
-try:
-    import tomllib
-except ImportError:
-    import toml as tomllib  # type: ignore
+import toml
 
 
 # ============================================================================
@@ -165,18 +162,10 @@ class NebulaType:
 class TypeConverter:
     """Converts Python values to NebulaGraph types with validation."""
     
-    __slots__ = ("truncate_strings", "output_format")
+    __slots__ = ("truncate_strings",)
     
-    def __init__(self, truncate_strings: bool = False, output_format: str = "nebula"):
-        """
-        Initialize converter.
-        
-        Args:
-            truncate_strings: If True, truncate strings that exceed FIXED_STRING length
-            output_format: 'nebula' for NebulaGraph-compatible output, 'python' for Python objects
-        """
+    def __init__(self, truncate_strings: bool = False):
         self.truncate_strings = truncate_strings
-        self.output_format = output_format
     
     def convert(self, value: Any, nebula_type: NebulaType) -> Any:
         """Convert and validate value according to NebulaType."""
@@ -198,30 +187,21 @@ class TypeConverter:
         if base in ("FLOAT", "DOUBLE"):
             return self._convert_float(value)
         
-        # Temporal types - return Unix timestamp for NebulaGraph
-        if base == "TIMESTAMP":
-            dt = parse_timestamp(value)
-            return int(dt.timestamp())
+        # Temporal types
+        if base in ("TIMESTAMP", "DATETIME"):
+            return parse_timestamp(value)
         
-        # DATETIME - return ISO format string
-        if base == "DATETIME":
-            dt = parse_timestamp(value)
-            return dt.strftime("%Y-%m-%d %H:%M:%S")
-        
-        # DATE - return ISO format string
         if base == "DATE":
-            d = parse_date(value)
-            return d.strftime("%Y-%m-%d")
+            return parse_date(value)
         
-        # TIME - return ISO format string
         if base == "TIME":
-            t = parse_time(value)
-            return t.strftime("%H:%M:%S")
+            return parse_time(value)
         
         raise SchemaError(f"Unsupported type for conversion: {base}")
     
     def _convert_string(self, value: Any, nebula_type: NebulaType) -> str:
         """Convert to string with optional length validation."""
+        # Never return None, convert to empty string
         string_val = "" if value is None else str(value)
         
         if nebula_type.base == "FIXED_STRING" and nebula_type.size:
@@ -345,11 +325,11 @@ class SchemaRegistry:
         path = Path(path_or_content)
         
         if path.exists() and path.is_file():
-            with path.open("rb") as f:
-                data = tomllib.load(f)
+            with path.open("r", encoding="utf-8") as f:
+                data = toml.load(f)
         else:
             # Treat as TOML string content
-            data = tomllib.loads(str(path_or_content))
+            data = toml.loads(str(path_or_content))
         
         return cls(data)
     
@@ -619,14 +599,21 @@ class GraphValidator:
             
             # Handle missing or null values
             if not has_value or raw_value is None:
+                # Try to apply default first
                 if self.options.apply_defaults and spec.has_default():
                     default_value = self._resolve_default(spec)
                     validated[prop_name] = self.converter.convert(default_value, spec.nebula_type)
                 elif spec.nullable:
-                    validated[prop_name] = None
+                    # Only set None if explicitly nullable and no default available
+                    if spec.has_default():
+                        default_value = self._resolve_default(spec)
+                        validated[prop_name] = self.converter.convert(default_value, spec.nebula_type)
+                    else:
+                        # Return default value based on type instead of None
+                        validated[prop_name] = self._get_type_default(spec.nebula_type)
                 else:
                     raise ValidationError(
-                        f"{entity_label}: Required property '{prop_name}' is missing"
+                        f"{entity_label}: Required non-nullable property '{prop_name}' is missing or None"
                     )
                 continue
             
@@ -643,6 +630,34 @@ class GraphValidator:
                     validated[prop_name] = value
         
         return validated
+    
+    def _get_type_default(self, nebula_type: NebulaType) -> Any:
+        """Get appropriate default value for a type when None is not acceptable."""
+        base = nebula_type.base
+        
+        if base in ("STRING", "FIXED_STRING"):
+            return ""
+        
+        if base == "BOOL":
+            return False
+        
+        if base in ("INT", "INT8", "INT16", "INT32", "INT64"):
+            return 0
+        
+        if base in ("FLOAT", "DOUBLE"):
+            return 0.0
+        
+        if base in ("TIMESTAMP", "DATETIME"):
+            return datetime.now(tz=timezone.utc)
+        
+        if base == "DATE":
+            return date.today()
+        
+        if base == "TIME":
+            return time(0, 0, 0)
+        
+        # Fallback: raise error if no suitable default
+        raise ValidationError(f"Cannot determine default value for type {nebula_type}")
     
     def _resolve_default(self, spec: PropertySpec) -> Any:
         """Resolve default value, handling special functions like now()."""
@@ -797,6 +812,29 @@ def main():
             print(f"  {case['desc']}: Unexpectedly passed")
         except ValidationError as e:
             print(f"  {case['desc']}: ✓ Caught error - {e}")
+    
+    # Example 5: Test None handling with defaults
+    print("\n" + "=" * 60)
+    print("Example 5: None Value Handling")
+    print("=" * 60)
+    
+    data_with_none = {
+        "name": "Test Policy",
+        "type": "policy",
+        "business_scope": None,  # Should use type default (empty string)
+        "version_number": "1.0.0"
+        # created_at missing - should use schema default (now())
+        # is_active missing - should use schema default (true)
+    }
+    
+    try:
+        validated = validator.validate_tag("Policy", data_with_none)
+        print("✓ Validation successful with None handling!")
+        print(f"business_scope (was None): '{validated['business_scope']}'")
+        print(f"created_at (was missing): {validated['created_at']}")
+        print(f"is_active (was missing): {validated['is_active']}")
+    except ValidationError as e:
+        print(f"✗ Validation failed: {e}")
 
 
 if __name__ == "__main__":
