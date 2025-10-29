@@ -1,48 +1,28 @@
-Got it — here’s a clean, reliable way to run your Flask app on Red Hat (RHEL) using **Gunicorn + systemd** (recommended), plus a quick “works-now” option with `nohup`. I’ll assume:
-
-* App file: `/home/emerg1/shivam/app.py`
-* Virtualenv: `/home/emerg1/.venv/`
-* Your Flask app object is named `app` inside `app.py`
-
-If your app uses a factory (`create_app()`), I show what to change in step 3.
-
----
-
-# Option A (recommended): Gunicorn + systemd (auto-start, auto-restart)
-
-### 1) Install system packages
-
-```bash
-sudo dnf -y update
-sudo dnf -y install python3 python3-devel gcc policycoreutils-python-utils firewalld
-sudo systemctl enable --now firewalld
-```
-
-### 2) Install project dependencies inside your venv
-
-```bash
 # as user: emerg1
 source /home/emerg1/.venv/bin/activate
-pip install --upgrade pip
-pip install gunicorn flask
-# (also install your app deps here, e.g. pip install -r /home/emerg1/shivam/requirements.txt)
+cd /home/emerg1/shivam
+
+# make (or verify) wsgi.py
+python - <<'PY'
+import os, sys
+p = "/home/emerg1/shivam/wsgi.py"
+if not os.path.exists(p):
+    with open(p, "w") as f:
+        f.write("from app import app\n")  # assumes app.py defines `app`
+print("wsgi.py present. Import test follows…")
+import importlib
+mod = importlib.import_module("wsgi")
+print("Import OK:", hasattr(mod, "app"))
+PY
+
+# quick manual run test (Ctrl+C to stop if it starts fine)
+gunicorn --bind 0.0.0.0:8000 wsgi:app
 deactivate
-```
 
-### 3) (Optional but tidy) Add a tiny WSGI entry point
 
-This makes Gunicorn’s target explicit and decouples from your main file.
 
-```bash
-cat > /home/emerg1/shivam/wsgi.py << 'EOF'
-from app import app  # assumes app.py defines `app = Flask(__name__)`
-# If you use an app factory, use:
-# from app import create_app
-# app = create_app()
-EOF
-```
 
-> If you use a factory, replace the import with the commented lines above.
+.
 
 ### 4) Test Gunicorn manually first (port 8000)
 
