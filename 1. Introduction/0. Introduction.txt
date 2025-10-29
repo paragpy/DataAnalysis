@@ -1,275 +1,119 @@
-sudo tee /etc/systemd/system/flask-app.service > /dev/null <<'EOF'
-[Unit]
-Description=Gunicorn for Flask app (shivam)
-After=network.target
+I'll help you deploy your Flask application on a Red Hat Linux server. Here's a comprehensive guide with production-ready setup using Gunicorn and Nginx.
 
-[Service]
-User=emerg1
-Group=emerg1
-WorkingDirectory=/home/emerg1/shivam
-Environment="PATH=/home/emerg1/.venv/bin"
-ExecStart=/home/emerg1/.venv/bin/gunicorn --chdir /home/emerg1/shivam --workers 3 --bind 0.0.0.0:5000 wsgi:app
-Restart=always
-RestartSec=3
-TimeoutStopSec=15
+## Deployment Steps for Flask on Red Hat Linux
 
-[Install]
-WantedBy=multi-user.target
-EOF
+### 1. **Prepare Your Application**
 
-
-
-
-
-
-
-
-
-
-
-
-Nice—your screenshots give us three key facts:
-
-* `gunicorn` **exists** and is executable.
-* The shebang points to `/home/emerg1/.venv/bin/python3.9` (good).
-* `/home` is **not** mounted `noexec`, so that’s not the reason.
-
-With those ruled out, `status=203/EXEC` is almost always one of these:
-
-1. **Unit file has Windows CRLF** line endings → systemd can’t exec the path.
-2. **SELinux** (bad label on the venv or denial).
-3. Subtle **permissions/exec path** issue when systemd launches it (but we can test that directly).
-
-Do the following, in order:
-
----
-
-## 1) Normalize the unit file (fix CRLF, stray chars)
+First, verify your Flask app structure:
 
 ```bash
-# show if CRLFs exist (you'll see ^M at line ends if so)
-sudo sed -n 'l' /etc/systemd/system/flask-app.service
-
-# strip any CRLFs just in case
-sudo sed -i 's/\r$//' /etc/systemd/system/flask-app.service
-
-# also re-create a clean unit to be 100% sure:
-sudo tee /etc/systemd/system/flask-app.service > /dev/null <<'EOF'
-[Unit]
-Description=Gunicorn for Flask app (shivam)
-After=network.target
-
-[Service]
-User=emerg1
-Group=emerg1
-WorkingDirectory=/home/emerg1/shivam
-Environment="PATH=/home/emerg1/.venv/bin"
-ExecStart=/home/emerg1/.venv/bin/gunicorn --chdir /home/emerg1/shivam --workers 3 --bind 0.0.0.0:5000 wsgi:app
-Restart=always
-RestartSec=3
-TimeoutStopSec=15
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl restart flask-app
-sudo systemctl status flask-app --no-pager
+# Check your app.py
+cat /home/emerg1/shivam/app.py
 ```
 
-If it still shows `203/EXEC`, continue.
+Ensure your app has the standard Flask structure:
+```python
+from flask import Flask
 
----
+app = Flask(__name__)
 
-## 2) Prove the ExecStart is runnable in the same way systemd runs it
+@app.route('/')
+def hello():
+    return 'Hello World!'
 
-```bash
-# run the exact ExecStart as the service user via sudo
-sudo -u emerg1 /home/emerg1/.venv/bin/gunicorn --chdir /home/emerg1/shivam --workers 1 --bind 0.0.0.0:5000 wsgi:app
+if __name__ == '__main__':
+    app.run()
 ```
 
-* If this **starts** (you’ll see worker boot messages), press `Ctrl+C` and go to step 3.
-* If this **fails**, paste the exact error text here.
-
----
-
-## 3) Check SELinux and fix labels if needed
+### 2. **Install System Dependencies**
 
 ```bash
-getenforce
-# If 'Enforcing', look for denials:
-sudo ausearch -m avc -ts recent | tail -n 20
+# Update system
+sudo dnf update -y
+
+# Install Python and development tools
+sudo dnf install python3 python3-pip python3-devel gcc -y
+
+# Install Nginx
+sudo dnf install nginx -y
+
+# Install supervisord (for process management)
+sudo dnf install supervisor -y
 ```
 
-If you see AVC denials, relabel the venv and project:
+### 3. **Set Up Python Environment**
 
 ```bash
-sudo restorecon -R -v /home/emerg1/.venv /home/emerg1/shivam
-# allow services like this to make outbound connections if you later put nginx, etc.
-sudo setsebool -P httpd_can_network_connect 1
-```
-
-Retry:
-
-```bash
-sudo systemctl restart flask-app
-sudo systemctl status flask-app --no-pager
-```
-
----
-
-## 4) (Bulletproof) Use a tiny wrapper script
-
-This sidesteps any odd parsing/quoting issues in the unit file.
-
-```bash
-cat > /home/emerg1/start_gunicorn.sh <<'EOF'
-#!/bin/bash
-exec /home/emerg1/.venv/bin/gunicorn --chdir /home/emerg1/shivam --workers 3 --bind 0.0.0.0:5000 wsgi:app
-EOF
-chmod 755 /home/emerg1/start_gunicorn.sh
-
-sudo tee /etc/systemd/system/flask-app.service > /dev/null <<'EOF'
-[Unit]
-Description=Gunicorn for Flask app (shivam)
-After=network.target
-
-[Service]
-User=emerg1
-Group=emerg1
-WorkingDirectory=/home/emerg1/shivam
-ExecStart=/home/emerg1/start_gunicorn.sh
-Restart=always
-RestartSec=3
-TimeoutStopSec=15
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl restart flask-app
-sudo systemctl status flask-app --no-pager
-```
-
----
-
-## 5) If it STILL says 203/EXEC…
-
-Move the venv to a neutral path (sometimes home-dir contexts/ACLs get weird):
-
-```bash
-sudo mkdir -p /opt/venvs
-sudo chown -R emerg1:emerg1 /opt/venvs
-python3 -m venv /opt/venvs/appenv
-source /opt/venvs/appenv/bin/activate
-pip install --upgrade pip gunicorn flask
-# (plus your app’s requirements)
-deactivate
-
-sudo sed -i 's#/home/emerg1/.venv#/opt/venvs/appenv#g' /etc/systemd/system/flask-app.service
-sudo systemctl daemon-reload
-sudo systemctl restart flask-app
-sudo systemctl status flask-app --no-pager
-```
-
----
-
-### Quick sanity checks you can paste back
-
-Please run these and share the outputs if you hit another snag:
-
-```bash
-sudo systemctl status flask-app --no-pager
-sudo journalctl -u flask-app -n 50 --no-pager
-sudo -u emerg1 /home/emerg1/.venv/bin/gunicorn --version
-sudo -u emerg1 /home/emerg1/.venv/bin/python3.9 -c 'print("py-ok")'
-```
-
-We’ll zero in from there.
-
-
-
-
-
-
-
-
-
-
-
-
-Got it — here’s a clean, reliable way to run your Flask app on Red Hat (RHEL) using **Gunicorn + systemd** (recommended), plus a quick “works-now” option with `nohup`. I’ll assume:
-
-* App file: `/home/emerg1/shivam/app.py`
-* Virtualenv: `/home/emerg1/.venv/`
-* Your Flask app object is named `app` inside `app.py`
-
-If your app uses a factory (`create_app()`), I show what to change in step 3.
-
----
-
-# Option A (recommended): Gunicorn + systemd (auto-start, auto-restart)
-
-### 1) Install system packages
-
-```bash
-sudo dnf -y update
-sudo dnf -y install python3 python3-devel gcc policycoreutils-python-utils firewalld
-sudo systemctl enable --now firewalld
-```
-
-### 2) Install project dependencies inside your venv
-
-```bash
-# as user: emerg1
+# Activate your existing virtual environment
 source /home/emerg1/.venv/bin/activate
-pip install --upgrade pip
+
+# Install production dependencies
 pip install gunicorn flask
-# (also install your app deps here, e.g. pip install -r /home/emerg1/shivam/requirements.txt)
-deactivate
+
+# Create requirements.txt if you don't have one
+pip freeze > /home/emerg1/shivam/requirements.txt
 ```
 
-### 3) (Optional but tidy) Add a tiny WSGI entry point
+### 4. **Create Gunicorn Configuration**
 
-This makes Gunicorn’s target explicit and decouples from your main file.
+Create a Gunicorn configuration file:
 
 ```bash
-cat > /home/emerg1/shivam/wsgi.py << 'EOF'
-from app import app  # assumes app.py defines `app = Flask(__name__)`
-# If you use an app factory, use:
-# from app import create_app
-# app = create_app()
-EOF
+sudo nano /home/emerg1/shivam/gunicorn_config.py
 ```
 
-> If you use a factory, replace the import with the commented lines above.
+Add this content:
 
-### 4) Test Gunicorn manually first (port 8000)
+```python
+# Gunicorn configuration file
+import multiprocessing
 
-```bash
-# as user: emerg1
-source /home/emerg1/.venv/bin/activate
-cd /home/emerg1/shivam
-gunicorn --bind 0.0.0.0:8000 wsgi:app
+# Server socket
+bind = "127.0.0.1:8000"
+backlog = 2048
+
+# Worker processes
+workers = multiprocessing.cpu_count() * 2 + 1
+worker_class = 'sync'
+worker_connections = 1000
+timeout = 30
+keepalive = 2
+
+# Logging
+accesslog = '/var/log/gunicorn/access.log'
+errorlog = '/var/log/gunicorn/error.log'
+loglevel = 'info'
+
+# Process naming
+proc_name = 'flask_app'
+
+# Server mechanics
+daemon = False
+pidfile = '/var/run/gunicorn.pid'
+user = 'emerg1'
+group = 'emerg1'
 ```
 
-Visit `http://<server-ip>:8000`. If it works, Ctrl+C to stop.
-
-Open firewall:
+Create log directory:
 
 ```bash
-sudo firewall-cmd --add-port=8000/tcp --permanent
-sudo firewall-cmd --reload
+sudo mkdir -p /var/log/gunicorn
+sudo chown emerg1:emerg1 /var/log/gunicorn
 ```
 
-### 5) Create a systemd service
+### 5. **Create Systemd Service**
+
+Create a systemd service file for automatic startup:
 
 ```bash
-sudo tee /etc/systemd/system/flask-app.service > /dev/null << 'EOF'
+sudo nano /etc/systemd/system/flask-app.service
+```
+
+Add this content:
+
+```ini
 [Unit]
-Description=Gunicorn for Flask app (shivam)
+Description=Flask Application with Gunicorn
 After=network.target
 
 [Service]
@@ -277,159 +121,164 @@ User=emerg1
 Group=emerg1
 WorkingDirectory=/home/emerg1/shivam
 Environment="PATH=/home/emerg1/.venv/bin"
-# Tune workers: 2-4 per CPU core typically; start small if low RAM/CPU
-ExecStart=/home/emerg1/.venv/bin/gunicorn --workers 3 --bind 0.0.0.0:8000 wsgi:app
+ExecStart=/home/emerg1/.venv/bin/gunicorn --config /home/emerg1/shivam/gunicorn_config.py app:app
+
 Restart=always
-RestartSec=3
-TimeoutStopSec=15
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
-EOF
 ```
 
-Reload and start:
+Enable and start the service:
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now flask-app
-sudo systemctl status flask-app --no-pager
+sudo systemctl enable flask-app
+sudo systemctl start flask-app
+sudo systemctl status flask-app
 ```
 
-Logs (useful for debugging):
+### 6. **Configure Nginx as Reverse Proxy**
+
+Create Nginx configuration:
 
 ```bash
-journalctl -u flask-app -f
+sudo nano /etc/nginx/conf.d/flask-app.conf
 ```
 
-> That’s it — your app now starts on boot and restarts if it crashes.
+Add this content:
 
----
-
-# Optional: Put Nginx in front (serve on port 80/443)
-
-If you want a standard web port and TLS later:
-
-### 6) Install and configure Nginx
-
-```bash
-sudo dnf -y install nginx
-sudo systemctl enable --now nginx
-sudo firewall-cmd --add-service=http --permanent
-sudo firewall-cmd --add-service=https --permanent
-sudo firewall-cmd --reload
-```
-
-Create a site config that **proxies to Gunicorn** on 127.0.0.1:8000 (safer than 0.0.0.0). First, tweak the systemd service to bind localhost only:
-
-```bash
-sudo sed -i 's/0.0.0.0:8000/127.0.0.1:8000/' /etc/systemd/system/flask-app.service
-sudo systemctl daemon-reload
-sudo systemctl restart flask-app
-```
-
-Now Nginx config:
-
-```bash
-sudo tee /etc/nginx/conf.d/flask_app.conf > /dev/null << 'EOF'
+```nginx
 server {
     listen 80;
-    server_name _;
+    server_name your_domain.com;  # Replace with your domain or server IP
+
+    access_log /var/log/nginx/flask-app-access.log;
+    error_log /var/log/nginx/flask-app-error.log;
 
     location / {
-        proxy_pass         http://127.0.0.1:8000;
-        proxy_set_header   Host $host;
-        proxy_set_header   X-Real-IP $remote_addr;
-        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header   X-Forwarded-Proto $scheme;
-        proxy_read_timeout 300;
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        
+        # Timeouts
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+
+    # Static files (if you have them)
+    location /static {
+        alias /home/emerg1/shivam/static;
+        expires 30d;
     }
 }
-EOF
+```
+
+Test and restart Nginx:
+
+```bash
+# Test Nginx configuration
 sudo nginx -t
-sudo systemctl reload nginx
+
+# Enable and start Nginx
+sudo systemctl enable nginx
+sudo systemctl restart nginx
 ```
 
-### 7) SELinux (if enforcing)
-
-Allow Nginx to proxy to a local port:
+### 7. **Configure Firewall**
 
 ```bash
-sudo setsebool -P httpd_can_network_connect 1
-```
+# Open HTTP port
+sudo firewall-cmd --permanent --add-service=http
 
-(You don’t need to relabel your home dir because Gunicorn reads files as `User=emerg1`, not by Nginx.)
+# Open HTTPS port (for future SSL)
+sudo firewall-cmd --permanent --add-service=https
 
----
-
-# Option B (quick & dirty): `nohup` (good for a quick test, not production)
-
-From your project directory:
-
-```bash
-# as user: emerg1
-source /home/emerg1/.venv/bin/activate
-cd /home/emerg1/shivam
-pip install flask gunicorn  # if not already
-nohup gunicorn --bind 0.0.0.0:8000 wsgi:app > gunicorn.out 2>&1 &
-echo $! > gunicorn.pid
-deactivate
-```
-
-* Check: `tail -f gunicorn.out`
-* Stop later: `kill $(cat gunicorn.pid)`
-
-Open firewall:
-
-```bash
-sudo firewall-cmd --add-port=8000/tcp --permanent
+# Reload firewall
 sudo firewall-cmd --reload
 ```
 
-> This won’t auto-start on reboot and is easier to lose track of — prefer systemd.
+### 8. **Set SELinux Permissions** (Red Hat specific)
 
----
+```bash
+# Allow Nginx to connect to network
+sudo setsebool -P httpd_can_network_connect 1
 
-## Common tweaks
+# Set proper context for your app directory
+sudo semanage fcontext -a -t httpd_sys_content_t "/home/emerg1/shivam(/.*)?"
+sudo restorecon -Rv /home/emerg1/shivam
+```
 
-* **Workers & threads**:
-  In `ExecStart`, try:
+### 9. **Test Your Deployment**
 
-  ```
-  ... gunicorn --workers 2 --threads 4 --timeout 120 --bind 127.0.0.1:8000 wsgi:app
-  ```
+```bash
+# Check if Gunicorn is running
+sudo systemctl status flask-app
 
-  Adjust for CPU/RAM.
+# Check if Nginx is running
+sudo systemctl status nginx
 
-* **Environment variables** (e.g., `FLASK_ENV`, secrets):
-  Add to the `[Service]` block:
+# Test locally
+curl http://localhost
 
-  ```
-  Environment="FLASK_ENV=production"
-  Environment="MY_SETTING=value"
-  ```
+# Check logs if there are issues
+sudo journalctl -u flask-app -f
+sudo tail -f /var/log/nginx/flask-app-error.log
+sudo tail -f /var/log/gunicorn/error.log
+```
 
-  Or use an `.env` loader inside your app.
+### 10. **Useful Management Commands**
 
-* **App factory pattern**:
-  If your app is created by `create_app()`, set `wsgi.py` to:
+```bash
+# Restart your Flask app
+sudo systemctl restart flask-app
 
-  ```python
-  from app import create_app
-  app = create_app()
-  ```
+# View Flask app logs
+sudo journalctl -u flask-app -n 50
 
-* **Static files**:
-  For heavy static, let Nginx serve them directly:
+# Restart Nginx
+sudo systemctl restart nginx
 
-  ```nginx
-  location /static/ {
-      alias /home/emerg1/shivam/static/;
-      access_log off;
-      expires 7d;
-  }
-  ```
+# Check all service statuses
+sudo systemctl status flask-app nginx
+```
 
----
+## Optional: SSL/HTTPS Setup with Let's Encrypt
 
-If you paste any errors (from `journalctl -u flask-app -xe` or `gunicorn.out`) I’ll pinpoint fixes fast.
+```bash
+# Install Certbot
+sudo dnf install certbot python3-certbot-nginx -y
+
+# Obtain SSL certificate
+sudo certbot --nginx -d your_domain.com
+
+# Auto-renewal is set up automatically
+sudo systemctl status certbot-renew.timer
+```
+
+## Troubleshooting Common Issues
+
+**If the app doesn't start:**
+```bash
+# Check for port conflicts
+sudo netstat -tulpn | grep :8000
+
+# Verify Python path
+which python3
+/home/emerg1/.venv/bin/python --version
+```
+
+**If you get permission errors:**
+```bash
+# Fix ownership
+sudo chown -R emerg1:emerg1 /home/emerg1/shivam
+
+# Check file permissions
+chmod +x /home/emerg1/shivam/app.py
+```
+
+This setup gives you a production-ready Flask deployment with automatic restart, logging, and proper security configurations for Red Hat Linux!
