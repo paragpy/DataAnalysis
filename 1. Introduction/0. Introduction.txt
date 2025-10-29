@@ -1,21 +1,31 @@
-ExecStartPre=/bin/bash -c 'echo "=== DEBUG INFO ===" && pwd && echo "User: $(whoami)" && echo "Path: $PATH" && ls -la /home/emerg1/shivam/ && echo "Python location:" && which python3'
+Perfect! Here's the complete deployment guide using Gunicorn with Unix sockets for your Red Hat server. This is a more robust production setup.
 
+## Complete Red Hat Flask Deployment with Gunicorn Socket
 
-
-I'll help you deploy your Flask application on a Red Hat Linux server. Here's a comprehensive guide with production-ready setup using Gunicorn and Nginx.
-
-## Deployment Steps for Flask on Red Hat Linux
-
-### 1. **Prepare Your Application**
-
-First, verify your Flask app structure:
+### Step 1: Prepare Your Application
 
 ```bash
-# Check your app.py
+# Navigate to your app directory
+cd /home/emerg1/shivam
+
+# Activate virtual environment
+source /home/emerg1/.venv/bin/activate
+
+# Install required packages
+pip install gunicorn flask
+pip freeze > requirements.txt
+```
+
+### Step 2: Verify Your Flask App Structure
+
+Make sure your `app.py` has the Flask application object:
+
+```bash
 cat /home/emerg1/shivam/app.py
 ```
 
-Ensure your app has the standard Flask structure:
+It should have something like:
+
 ```python
 from flask import Flask
 
@@ -25,45 +35,15 @@ app = Flask(__name__)
 def hello():
     return 'Hello World!'
 
-if __name__ == '__main__':
-    app.run()
+# For Gunicorn, remove or comment out:
+# if __name__ == '__main__':
+#     app.run()
 ```
 
-### 2. **Install System Dependencies**
+### Step 3: Create Gunicorn Configuration File
 
 ```bash
-# Update system
-sudo dnf update -y
-
-# Install Python and development tools
-sudo dnf install python3 python3-pip python3-devel gcc -y
-
-# Install Nginx
-sudo dnf install nginx -y
-
-# Install supervisord (for process management)
-sudo dnf install supervisor -y
-```
-
-### 3. **Set Up Python Environment**
-
-```bash
-# Activate your existing virtual environment
-source /home/emerg1/.venv/bin/activate
-
-# Install production dependencies
-pip install gunicorn flask
-
-# Create requirements.txt if you don't have one
-pip freeze > /home/emerg1/shivam/requirements.txt
-```
-
-### 4. **Create Gunicorn Configuration**
-
-Create a Gunicorn configuration file:
-
-```bash
-sudo nano /home/emerg1/shivam/gunicorn_config.py
+nano /home/emerg1/shivam/gunicorn_config.py
 ```
 
 Add this content:
@@ -72,20 +52,24 @@ Add this content:
 # Gunicorn configuration file
 import multiprocessing
 
-# Server socket
-bind = "127.0.0.1:8000"
-backlog = 2048
+# Socket binding
+bind = "unix:/run/gunicorn/gunicorn.sock"
 
 # Worker processes
 workers = multiprocessing.cpu_count() * 2 + 1
 worker_class = 'sync'
 worker_connections = 1000
-timeout = 30
-keepalive = 2
+max_requests = 100
+max_requests_jitter = 50
+timeout = 300
+keepalive = 3
+
+# Preload app for better performance
+preload_app = True
 
 # Logging
-accesslog = '/var/log/gunicorn/access.log'
-errorlog = '/var/log/gunicorn/error.log'
+accesslog = '-'  # Log to stdout
+errorlog = '-'   # Log to stderr
 loglevel = 'info'
 
 # Process naming
@@ -93,196 +77,353 @@ proc_name = 'flask_app'
 
 # Server mechanics
 daemon = False
-pidfile = '/var/run/gunicorn.pid'
-user = 'emerg1'
-group = 'emerg1'
 ```
 
-Create log directory:
+### Step 4: Create Gunicorn Socket File
 
 ```bash
-sudo mkdir -p /var/log/gunicorn
-sudo chown emerg1:emerg1 /var/log/gunicorn
+sudo nano /etc/systemd/system/gunicorn.socket
 ```
 
-### 5. **Create Systemd Service**
+Add this content (adjusted for your user):
 
-Create a systemd service file for automatic startup:
+```ini
+[Unit]
+Description=gunicorn socket
+
+[Socket]
+ListenStream=/run/gunicorn/gunicorn.sock
+SocketUser=emerg1
+SocketGroup=nginx
+SocketMode=0660
+
+[Install]
+WantedBy=sockets.target
+```
+
+### Step 5: Create Gunicorn Service File
 
 ```bash
-sudo nano /etc/systemd/system/flask-app.service
+sudo nano /etc/systemd/system/gunicorn.service
 ```
 
 Add this content:
 
 ```ini
 [Unit]
-Description=Flask Application with Gunicorn
+Description=gunicorn daemon
+Requires=gunicorn.socket
 After=network.target
 
 [Service]
+Type=notify
 User=emerg1
-Group=emerg1
+Group=nginx
 WorkingDirectory=/home/emerg1/shivam
-Environment="PATH=/home/emerg1/.venv/bin"
-ExecStart=/home/emerg1/.venv/bin/gunicorn --config /home/emerg1/shivam/gunicorn_config.py app:app
 
-Restart=always
+# systemd creates /run/gunicorn with correct perms
+RuntimeDirectory=gunicorn
+
+# Environment
+Environment="PATH=/home/emerg1/.venv/bin:/usr/local/bin:/usr/bin"
+Environment="PYTHONPATH=/home/emerg1/shivam"
+
+# Start Gunicorn
+ExecStart=/home/emerg1/.venv/bin/gunicorn \
+          --config /home/emerg1/shivam/gunicorn_config.py \
+          app:app
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+# Restart policy
+Restart=on-failure
 RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-Enable and start the service:
+### Step 6: Add User to Nginx Group
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable flask-app
-sudo systemctl start flask-app
-sudo systemctl status flask-app
+# Add emerg1 user to nginx group
+sudo usermod -a -G nginx emerg1
+
+# Verify group membership
+groups emerg1
+
+# You may need to logout and login for group changes to take effect
 ```
 
-### 6. **Configure Nginx as Reverse Proxy**
+### Step 7: Start and Enable Gunicorn Socket
 
-Create Nginx configuration:
+```bash
+# Stop any existing flask-app service
+sudo systemctl stop flask-app 2>/dev/null || true
+sudo systemctl disable flask-app 2>/dev/null || true
+
+# Reload systemd
+sudo systemctl daemon-reload
+
+# Start and enable the socket
+sudo systemctl start gunicorn.socket
+sudo systemctl enable gunicorn.socket
+
+# Check socket status
+sudo systemctl status gunicorn.socket
+
+# Verify socket file was created
+sudo ls -la /run/gunicorn/
+```
+
+### Step 8: Test Socket Activation
+
+```bash
+# Check if gunicorn service is inactive (normal before first request)
+sudo systemctl status gunicorn
+
+# Test the socket with curl (this will activate the service)
+curl --unix-socket /run/gunicorn/gunicorn.sock http://localhost/
+
+# Now check gunicorn service status (should be active)
+sudo systemctl status gunicorn
+
+# Watch logs in real-time
+sudo journalctl -u gunicorn -f
+```
+
+### Step 9: Configure Nginx
 
 ```bash
 sudo nano /etc/nginx/conf.d/flask-app.conf
 ```
 
-Add this content:
+Add this configuration:
 
 ```nginx
+upstream flask_app {
+    server unix:/run/gunicorn/gunicorn.sock fail_timeout=0;
+}
+
 server {
     listen 80;
-    server_name your_domain.com;  # Replace with your domain or server IP
+    server_name _;  # Replace with your domain or server IP
+
+    client_max_body_size 4G;
+    keepalive_timeout 5;
 
     access_log /var/log/nginx/flask-app-access.log;
     error_log /var/log/nginx/flask-app-error.log;
 
     location / {
-        proxy_pass http://127.0.0.1:8000;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-        
-        # Timeouts
-        proxy_connect_timeout 60s;
-        proxy_send_timeout 60s;
-        proxy_read_timeout 60s;
+        proxy_set_header Host $http_host;
+        proxy_redirect off;
+        proxy_buffering off;
+
+        proxy_pass http://flask_app;
     }
 
     # Static files (if you have them)
     location /static {
         alias /home/emerg1/shivam/static;
         expires 30d;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # Media files (if you have them)
+    location /media {
+        alias /home/emerg1/shivam/media;
+        expires 30d;
+        add_header Cache-Control "public, immutable";
     }
 }
 ```
 
-Test and restart Nginx:
+### Step 10: Test and Start Nginx
 
 ```bash
 # Test Nginx configuration
 sudo nginx -t
 
-# Enable and start Nginx
-sudo systemctl enable nginx
+# If test passes, restart Nginx
 sudo systemctl restart nginx
+sudo systemctl enable nginx
+
+# Check Nginx status
+sudo systemctl status nginx
 ```
 
-### 7. **Configure Firewall**
+### Step 11: Configure Firewall
 
 ```bash
-# Open HTTP port
+# Allow HTTP and HTTPS
 sudo firewall-cmd --permanent --add-service=http
-
-# Open HTTPS port (for future SSL)
 sudo firewall-cmd --permanent --add-service=https
-
-# Reload firewall
 sudo firewall-cmd --reload
+
+# Verify
+sudo firewall-cmd --list-all
 ```
 
-### 8. **Set SELinux Permissions** (Red Hat specific)
+### Step 12: Configure SELinux (Red Hat Specific)
 
 ```bash
-# Allow Nginx to connect to network
+# Allow Nginx to connect to the socket
 sudo setsebool -P httpd_can_network_connect 1
 
-# Set proper context for your app directory
+# Set proper SELinux context for socket directory
+sudo semanage fcontext -a -t httpd_sys_rw_content_t "/run/gunicorn(/.*)?"
+sudo restorecon -Rv /run/gunicorn
+
+# Set context for application directory
 sudo semanage fcontext -a -t httpd_sys_content_t "/home/emerg1/shivam(/.*)?"
 sudo restorecon -Rv /home/emerg1/shivam
+
+# If you get "command not found" for semanage, install it:
+# sudo dnf install policycoreutils-python-utils -y
 ```
 
-### 9. **Test Your Deployment**
+### Step 13: Test Your Deployment
 
 ```bash
-# Check if Gunicorn is running
-sudo systemctl status flask-app
+# Test via Unix socket directly
+curl --unix-socket /run/gunicorn/gunicorn.sock http://localhost/
 
-# Check if Nginx is running
-sudo systemctl status nginx
-
-# Test locally
+# Test via Nginx (localhost)
 curl http://localhost
 
-# Check logs if there are issues
-sudo journalctl -u flask-app -f
-sudo tail -f /var/log/nginx/flask-app-error.log
-sudo tail -f /var/log/gunicorn/error.log
+# Test from external
+curl http://YOUR_SERVER_IP
+
+# Or open in browser:
+# http://YOUR_SERVER_IP
 ```
 
-### 10. **Useful Management Commands**
+### Step 14: Monitor and Debug
 
 ```bash
-# Restart your Flask app
-sudo systemctl restart flask-app
+# View all logs in real-time
+sudo journalctl -u gunicorn -u nginx -f
 
-# View Flask app logs
-sudo journalctl -u flask-app -n 50
+# Check socket status
+sudo systemctl status gunicorn.socket
+
+# Check service status
+sudo systemctl status gunicorn
+
+# Check Nginx status
+sudo systemctl status nginx
+
+# View recent Gunicorn logs
+sudo journalctl -u gunicorn -n 50 --no-pager
+
+# View Nginx error logs
+sudo tail -f /var/log/nginx/flask-app-error.log
+
+# View Nginx access logs
+sudo tail -f /var/log/nginx/flask-app-access.log
+```
+
+## Useful Management Commands
+
+```bash
+# Restart Gunicorn
+sudo systemctl restart gunicorn
+
+# Restart socket (rarely needed)
+sudo systemctl restart gunicorn.socket
 
 # Restart Nginx
 sudo systemctl restart nginx
 
-# Check all service statuses
-sudo systemctl status flask-app nginx
+# Reload Gunicorn (graceful restart without dropping connections)
+sudo systemctl reload gunicorn
+
+# Stop everything
+sudo systemctl stop gunicorn nginx
+
+# Start everything
+sudo systemctl start gunicorn.socket nginx
+
+# Check if services are enabled
+sudo systemctl is-enabled gunicorn.socket gunicorn nginx
 ```
 
-## Optional: SSL/HTTPS Setup with Let's Encrypt
+## Troubleshooting Commands
 
 ```bash
-# Install Certbot
-sudo dnf install certbot python3-certbot-nginx -y
+# Check if socket file exists
+ls -la /run/gunicorn/
 
-# Obtain SSL certificate
-sudo certbot --nginx -d your_domain.com
+# Check socket permissions
+sudo stat /run/gunicorn/gunicorn.sock
 
-# Auto-renewal is set up automatically
-sudo systemctl status certbot-renew.timer
+# Test if Nginx can reach the socket
+sudo -u nginx curl --unix-socket /run/gunicorn/gunicorn.sock http://localhost/
+
+# Check for SELinux denials
+sudo ausearch -m avc -ts recent
+
+# Verify user groups
+id emerg1
+id nginx
+
+# Check listening sockets
+sudo ss -xl | grep gunicorn
 ```
 
-## Troubleshooting Common Issues
+## Performance Tuning
 
-**If the app doesn't start:**
+Edit the gunicorn_config.py for better performance:
+
 ```bash
-# Check for port conflicts
-sudo netstat -tulpn | grep :8000
-
-# Verify Python path
-which python3
-/home/emerg1/.venv/bin/python --version
+nano /home/emerg1/shivam/gunicorn_config.py
 ```
 
-**If you get permission errors:**
+```python
+import multiprocessing
+
+bind = "unix:/run/gunicorn/gunicorn.sock"
+
+# Adjust workers based on your needs
+# Formula: (2 x $num_cores) + 1
+workers = multiprocessing.cpu_count() * 2 + 1
+
+# For CPU-bound apps, use sync
+# For I/O-bound apps, consider gevent or eventlet
+worker_class = 'sync'
+
+# Restart workers after serving this many requests (prevents memory leaks)
+max_requests = 1000
+max_requests_jitter = 50
+
+# Timeout for workers
+timeout = 300
+
+# Keep-alive
+keepalive = 5
+
+# Preload app for faster worker spawning
+preload_app = True
+
+# Logging
+accesslog = '-'
+errorlog = '-'
+loglevel = 'info'
+
+# Graceful timeout
+graceful_timeout = 30
+```
+
+After making changes:
+
 ```bash
-# Fix ownership
-sudo chown -R emerg1:emerg1 /home/emerg1/shivam
-
-# Check file permissions
-chmod +x /home/emerg1/shivam/app.py
+sudo systemctl daemon-reload
+sudo systemctl restart gunicorn
 ```
 
-This setup gives you a production-ready Flask deployment with automatic restart, logging, and proper security configurations for Red Hat Linux!
+Your Flask application is now deployed with a production-ready setup using Gunicorn and Unix sockets! 🚀
