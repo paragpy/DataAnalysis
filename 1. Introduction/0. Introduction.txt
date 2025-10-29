@@ -1,3 +1,33 @@
+sudo tee /etc/systemd/system/flask-app.service > /dev/null <<'EOF'
+[Unit]
+Description=Gunicorn for Flask app (shivam)
+After=network.target
+
+[Service]
+User=emerg1
+Group=emerg1
+WorkingDirectory=/home/emerg1/shivam
+Environment="PATH=/home/emerg1/.venv/bin"
+ExecStart=/home/emerg1/.venv/bin/gunicorn --chdir /home/emerg1/shivam --workers 3 --bind 0.0.0.0:5000 wsgi:app
+Restart=always
+RestartSec=3
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+
+
+
+
+
+
+
+
+
+
+
 Nice—your screenshots give us three key facts:
 
 * `gunicorn` **exists** and is executable.
