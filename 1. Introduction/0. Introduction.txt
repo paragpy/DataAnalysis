@@ -1,3 +1,175 @@
+Nice—your screenshots give us three key facts:
+
+* `gunicorn` **exists** and is executable.
+* The shebang points to `/home/emerg1/.venv/bin/python3.9` (good).
+* `/home` is **not** mounted `noexec`, so that’s not the reason.
+
+With those ruled out, `status=203/EXEC` is almost always one of these:
+
+1. **Unit file has Windows CRLF** line endings → systemd can’t exec the path.
+2. **SELinux** (bad label on the venv or denial).
+3. Subtle **permissions/exec path** issue when systemd launches it (but we can test that directly).
+
+Do the following, in order:
+
+---
+
+## 1) Normalize the unit file (fix CRLF, stray chars)
+
+```bash
+# show if CRLFs exist (you'll see ^M at line ends if so)
+sudo sed -n 'l' /etc/systemd/system/flask-app.service
+
+# strip any CRLFs just in case
+sudo sed -i 's/\r$//' /etc/systemd/system/flask-app.service
+
+# also re-create a clean unit to be 100% sure:
+sudo tee /etc/systemd/system/flask-app.service > /dev/null <<'EOF'
+[Unit]
+Description=Gunicorn for Flask app (shivam)
+After=network.target
+
+[Service]
+User=emerg1
+Group=emerg1
+WorkingDirectory=/home/emerg1/shivam
+Environment="PATH=/home/emerg1/.venv/bin"
+ExecStart=/home/emerg1/.venv/bin/gunicorn --chdir /home/emerg1/shivam --workers 3 --bind 0.0.0.0:5000 wsgi:app
+Restart=always
+RestartSec=3
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl restart flask-app
+sudo systemctl status flask-app --no-pager
+```
+
+If it still shows `203/EXEC`, continue.
+
+---
+
+## 2) Prove the ExecStart is runnable in the same way systemd runs it
+
+```bash
+# run the exact ExecStart as the service user via sudo
+sudo -u emerg1 /home/emerg1/.venv/bin/gunicorn --chdir /home/emerg1/shivam --workers 1 --bind 0.0.0.0:5000 wsgi:app
+```
+
+* If this **starts** (you’ll see worker boot messages), press `Ctrl+C` and go to step 3.
+* If this **fails**, paste the exact error text here.
+
+---
+
+## 3) Check SELinux and fix labels if needed
+
+```bash
+getenforce
+# If 'Enforcing', look for denials:
+sudo ausearch -m avc -ts recent | tail -n 20
+```
+
+If you see AVC denials, relabel the venv and project:
+
+```bash
+sudo restorecon -R -v /home/emerg1/.venv /home/emerg1/shivam
+# allow services like this to make outbound connections if you later put nginx, etc.
+sudo setsebool -P httpd_can_network_connect 1
+```
+
+Retry:
+
+```bash
+sudo systemctl restart flask-app
+sudo systemctl status flask-app --no-pager
+```
+
+---
+
+## 4) (Bulletproof) Use a tiny wrapper script
+
+This sidesteps any odd parsing/quoting issues in the unit file.
+
+```bash
+cat > /home/emerg1/start_gunicorn.sh <<'EOF'
+#!/bin/bash
+exec /home/emerg1/.venv/bin/gunicorn --chdir /home/emerg1/shivam --workers 3 --bind 0.0.0.0:5000 wsgi:app
+EOF
+chmod 755 /home/emerg1/start_gunicorn.sh
+
+sudo tee /etc/systemd/system/flask-app.service > /dev/null <<'EOF'
+[Unit]
+Description=Gunicorn for Flask app (shivam)
+After=network.target
+
+[Service]
+User=emerg1
+Group=emerg1
+WorkingDirectory=/home/emerg1/shivam
+ExecStart=/home/emerg1/start_gunicorn.sh
+Restart=always
+RestartSec=3
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl restart flask-app
+sudo systemctl status flask-app --no-pager
+```
+
+---
+
+## 5) If it STILL says 203/EXEC…
+
+Move the venv to a neutral path (sometimes home-dir contexts/ACLs get weird):
+
+```bash
+sudo mkdir -p /opt/venvs
+sudo chown -R emerg1:emerg1 /opt/venvs
+python3 -m venv /opt/venvs/appenv
+source /opt/venvs/appenv/bin/activate
+pip install --upgrade pip gunicorn flask
+# (plus your app’s requirements)
+deactivate
+
+sudo sed -i 's#/home/emerg1/.venv#/opt/venvs/appenv#g' /etc/systemd/system/flask-app.service
+sudo systemctl daemon-reload
+sudo systemctl restart flask-app
+sudo systemctl status flask-app --no-pager
+```
+
+---
+
+### Quick sanity checks you can paste back
+
+Please run these and share the outputs if you hit another snag:
+
+```bash
+sudo systemctl status flask-app --no-pager
+sudo journalctl -u flask-app -n 50 --no-pager
+sudo -u emerg1 /home/emerg1/.venv/bin/gunicorn --version
+sudo -u emerg1 /home/emerg1/.venv/bin/python3.9 -c 'print("py-ok")'
+```
+
+We’ll zero in from there.
+
+
+
+
+
+
+
+
+
+
+
+
 Got it — here’s a clean, reliable way to run your Flask app on Red Hat (RHEL) using **Gunicorn + systemd** (recommended), plus a quick “works-now” option with `nohup`. I’ll assume:
 
 * App file: `/home/emerg1/shivam/app.py`
