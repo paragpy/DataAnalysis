@@ -1,3 +1,7 @@
+ExecStartPre=/bin/bash -c 'echo "=== DEBUG INFO ===" && pwd && echo "User: $(whoami)" && echo "Path: $PATH" && ls -la /home/emerg1/shivam/ && echo "Python location:" && which python3'
+
+
+
 I'll help you deploy your Flask application on a Red Hat Linux server. Here's a comprehensive guide with production-ready setup using Gunicorn and Nginx.
 
 ## Deployment Steps for Flask on Red Hat Linux
