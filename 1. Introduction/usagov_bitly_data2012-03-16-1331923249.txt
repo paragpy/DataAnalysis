@@ -1,127 +1,106 @@
-I'll help you deploy your Flask application on a Red Hat Linux server. Here's a comprehensive guide with production-ready setup using Gunicorn and Nginx.
+Perfect! Let's do a clean, simple deployment with uWSGI and Nginx. This is often more straightforward than Gunicorn with sockets.
 
-## Deployment Steps for Flask on Red Hat Linux
+## Complete uWSGI + Nginx Deployment Guide for Red Hat 8
 
-### 1. **Prepare Your Application**
-
-First, verify your Flask app structure:
+### Step 1: Clean Up Previous Setup
 
 ```bash
-# Check your app.py
-cat /home/emerg1/shivam/app.py
+# Stop and disable gunicorn services
+sudo systemctl stop gunicorn.service gunicorn.socket 2>/dev/null || true
+sudo systemctl disable gunicorn.service gunicorn.socket 2>/dev/null || true
+
+# Remove gunicorn socket directory
+sudo rm -rf /run/gunicorn
+
+# Remove old service files (optional, for clean slate)
+sudo rm -f /etc/systemd/system/gunicorn.service
+sudo rm -f /etc/systemd/system/gunicorn.socket
+
+sudo systemctl daemon-reload
 ```
 
-Ensure your app has the standard Flask structure:
-```python
-from flask import Flask
-
-app = Flask(__name__)
-
-@app.route('/')
-def hello():
-    return 'Hello World!'
-
-if __name__ == '__main__':
-    app.run()
-```
-
-### 2. **Install System Dependencies**
+### Step 2: Install uWSGI
 
 ```bash
-# Update system
-sudo dnf update -y
-
-# Install Python and development tools
-sudo dnf install python3 python3-pip python3-devel gcc -y
-
-# Install Nginx
-sudo dnf install nginx -y
-
-# Install supervisord (for process management)
-sudo dnf install supervisor -y
-```
-
-### 3. **Set Up Python Environment**
-
-```bash
-# Activate your existing virtual environment
+# Activate your virtual environment
+cd /home/emerg1/shivam
 source /home/emerg1/.venv/bin/activate
 
-# Install production dependencies
-pip install gunicorn flask
+# Install uWSGI
+pip install uwsgi flask
 
-# Create requirements.txt if you don't have one
-pip freeze > /home/emerg1/shivam/requirements.txt
+# Verify installation
+uwsgi --version
 ```
 
-### 4. **Create Gunicorn Configuration**
-
-Create a Gunicorn configuration file:
+### Step 3: Create uWSGI Configuration File
 
 ```bash
-sudo nano /home/emerg1/shivam/gunicorn_config.py
+nano /home/emerg1/shivam/uwsgi.ini
 ```
 
 Add this content:
 
-```python
-# Gunicorn configuration file
-import multiprocessing
+```ini
+[uwsgi]
+# Application settings
+module = app:app
+chdir = /home/emerg1/shivam
 
-# Server socket
-bind = "127.0.0.1:8000"
-backlog = 2048
+# Process management
+master = true
+processes = 4
+threads = 2
 
-# Worker processes
-workers = multiprocessing.cpu_count() * 2 + 1
-worker_class = 'sync'
-worker_connections = 1000
-timeout = 30
-keepalive = 2
+# Socket settings
+socket = /tmp/flask-app.sock
+chmod-socket = 666
+vacuum = true
+die-on-term = true
 
 # Logging
-accesslog = '/var/log/gunicorn/access.log'
-errorlog = '/var/log/gunicorn/error.log'
-loglevel = 'info'
-
-# Process naming
-proc_name = 'flask_app'
-
-# Server mechanics
-daemon = False
-pidfile = '/var/run/gunicorn.pid'
-user = 'emerg1'
-group = 'emerg1'
+logto = /home/emerg1/shivam/logs/uwsgi.log
+log-maxsize = 10000000
 ```
 
-Create log directory:
+### Step 4: Create Log Directory
 
 ```bash
-sudo mkdir -p /var/log/gunicorn
-sudo chown emerg1:emerg1 /var/log/gunicorn
+mkdir -p /home/emerg1/shivam/logs
 ```
 
-### 5. **Create Systemd Service**
-
-Create a systemd service file for automatic startup:
+### Step 5: Test uWSGI Manually
 
 ```bash
-sudo nano /etc/systemd/system/flask-app.service
+cd /home/emerg1/shivam
+source /home/emerg1/.venv/bin/activate
+
+# Test uWSGI
+uwsgi --ini uwsgi.ini
+
+# Press Ctrl+C to stop after verifying it starts without errors
+```
+
+### Step 6: Create uWSGI systemd Service
+
+```bash
+sudo nano /etc/systemd/system/flask-uwsgi.service
 ```
 
 Add this content:
 
 ```ini
 [Unit]
-Description=Flask Application with Gunicorn
+Description=uWSGI instance to serve Flask app
 After=network.target
 
 [Service]
 User=emerg1
-Group=emerg1
+Group=nginx
 WorkingDirectory=/home/emerg1/shivam
 Environment="PATH=/home/emerg1/.venv/bin"
-ExecStart=/home/emerg1/.venv/bin/gunicorn --config /home/emerg1/shivam/gunicorn_config.py app:app
+
+ExecStart=/home/emerg1/.venv/bin/uwsgi --ini /home/emerg1/shivam/uwsgi.ini
 
 Restart=always
 RestartSec=10
@@ -130,18 +109,26 @@ RestartSec=10
 WantedBy=multi-user.target
 ```
 
-Enable and start the service:
+### Step 7: Start and Enable uWSGI Service
 
 ```bash
+# Reload systemd
 sudo systemctl daemon-reload
-sudo systemctl enable flask-app
-sudo systemctl start flask-app
-sudo systemctl status flask-app
+
+# Start uWSGI service
+sudo systemctl start flask-uwsgi
+
+# Check status
+sudo systemctl status flask-uwsgi
+
+# Enable to start on boot
+sudo systemctl enable flask-uwsgi
+
+# Verify socket file was created
+ls -la /tmp/flask-app.sock
 ```
 
-### 6. **Configure Nginx as Reverse Proxy**
-
-Create Nginx configuration:
+### Step 8: Create/Update Nginx Configuration
 
 ```bash
 sudo nano /etc/nginx/conf.d/flask-app.conf
@@ -152,22 +139,18 @@ Add this content:
 ```nginx
 server {
     listen 80;
-    server_name your_domain.com;  # Replace with your domain or server IP
+    server_name 10.198.52.64;  # Your server IP or domain
 
     access_log /var/log/nginx/flask-app-access.log;
     error_log /var/log/nginx/flask-app-error.log;
 
     location / {
-        proxy_pass http://127.0.0.1:8000;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
+        include uwsgi_params;
+        uwsgi_pass unix:/tmp/flask-app.sock;
         
         # Timeouts
-        proxy_connect_timeout 60s;
-        proxy_send_timeout 60s;
-        proxy_read_timeout 60s;
+        uwsgi_read_timeout 300;
+        uwsgi_send_timeout 300;
     }
 
     # Static files (if you have them)
@@ -178,107 +161,234 @@ server {
 }
 ```
 
-Test and restart Nginx:
+### Step 9: Create Nginx Service File (if needed)
 
 ```bash
-# Test Nginx configuration
+sudo nano /usr/lib/systemd/system/nginx.service
+```
+
+Add this:
+
+```ini
+[Unit]
+Description=The nginx HTTP and reverse proxy server
+After=network-online.target remote-fs.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+PIDFile=/var/run/nginx.pid
+ExecStartPre=/usr/bin/rm -f /var/run/nginx.pid
+ExecStartPre=/usr/sbin/nginx -t
+ExecStart=/usr/sbin/nginx
+ExecReload=/usr/sbin/nginx -s reload
+KillSignal=SIGQUIT
+TimeoutStopSec=5
+KillMode=mixed
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Step 10: Fix Nginx Main Config for IPv6
+
+```bash
+sudo nano /etc/nginx/nginx.conf
+```
+
+Find and comment out any IPv6 listen directives:
+
+```nginx
+# Comment out or remove this line:
+# listen       [::]:80 default_server;
+```
+
+Or run this command to do it automatically:
+
+```bash
+sudo sed -i 's/^\s*listen\s*\[::\]/#&/' /etc/nginx/nginx.conf
+```
+
+### Step 11: Start Nginx
+
+```bash
+# Reload systemd
+sudo systemctl daemon-reload
+
+# Test nginx configuration
 sudo nginx -t
 
-# Enable and start Nginx
+# Start and enable nginx
+sudo systemctl start nginx
 sudo systemctl enable nginx
-sudo systemctl restart nginx
+
+# Check status
+sudo systemctl status nginx
 ```
 
-### 7. **Configure Firewall**
+### Step 12: Configure Firewall
 
 ```bash
-# Open HTTP port
+# Allow HTTP traffic
 sudo firewall-cmd --permanent --add-service=http
-
-# Open HTTPS port (for future SSL)
 sudo firewall-cmd --permanent --add-service=https
-
-# Reload firewall
 sudo firewall-cmd --reload
+
+# Verify
+sudo firewall-cmd --list-all
 ```
 
-### 8. **Set SELinux Permissions** (Red Hat specific)
+### Step 13: Configure SELinux Permissions
 
 ```bash
-# Allow Nginx to connect to network
+# Allow Nginx to connect to uWSGI socket
 sudo setsebool -P httpd_can_network_connect 1
 
-# Set proper context for your app directory
+# Set proper context for socket file
+sudo chcon -t httpd_sys_rw_content_t /tmp/flask-app.sock
+
+# Set context for app directory
 sudo semanage fcontext -a -t httpd_sys_content_t "/home/emerg1/shivam(/.*)?"
 sudo restorecon -Rv /home/emerg1/shivam
 ```
 
-### 9. **Test Your Deployment**
+### Step 14: Add User to Nginx Group
 
 ```bash
-# Check if Gunicorn is running
-sudo systemctl status flask-app
+sudo usermod -a -G nginx emerg1
 
-# Check if Nginx is running
-sudo systemctl status nginx
+# Verify
+groups emerg1
+```
+
+### Step 15: Test Your Deployment
+
+```bash
+# Check both services are running
+sudo systemctl status flask-uwsgi nginx
 
 # Test locally
 curl http://localhost
 
-# Check logs if there are issues
-sudo journalctl -u flask-app -f
-sudo tail -f /var/log/nginx/flask-app-error.log
-sudo tail -f /var/log/gunicorn/error.log
+# Test from external
+curl http://10.198.52.64
+
+# Check listening ports
+sudo ss -tlnp | grep :80
+
+# Check socket
+ls -la /tmp/flask-app.sock
 ```
 
-### 10. **Useful Management Commands**
+### Step 16: View Logs
 
 ```bash
-# Restart your Flask app
-sudo systemctl restart flask-app
+# uWSGI logs
+tail -f /home/emerg1/shivam/logs/uwsgi.log
 
-# View Flask app logs
-sudo journalctl -u flask-app -n 50
+# Nginx error logs
+sudo tail -f /var/log/nginx/flask-app-error.log
+
+# Nginx access logs
+sudo tail -f /var/log/nginx/flask-app-access.log
+
+# Systemd logs
+sudo journalctl -u flask-uwsgi -f
+```
+
+## Useful Management Commands
+
+```bash
+# Restart uWSGI
+sudo systemctl restart flask-uwsgi
 
 # Restart Nginx
 sudo systemctl restart nginx
 
-# Check all service statuses
-sudo systemctl status flask-app nginx
+# Check status of both
+sudo systemctl status flask-uwsgi nginx
+
+# View recent logs
+sudo journalctl -u flask-uwsgi -n 50
+
+# Reload uWSGI (graceful restart)
+sudo systemctl reload flask-uwsgi
+
+# Stop everything
+sudo systemctl stop flask-uwsgi nginx
+
+# Start everything
+sudo systemctl start flask-uwsgi nginx
 ```
 
-## Optional: SSL/HTTPS Setup with Let's Encrypt
+## Troubleshooting Commands
 
 ```bash
-# Install Certbot
-sudo dnf install certbot python3-certbot-nginx -y
+# If uWSGI fails to start
+sudo journalctl -u flask-uwsgi -n 100 --no-pager
 
-# Obtain SSL certificate
-sudo certbot --nginx -d your_domain.com
+# Test uWSGI manually
+cd /home/emerg1/shivam
+source /home/emerg1/.venv/bin/activate
+uwsgi --ini uwsgi.ini
 
-# Auto-renewal is set up automatically
-sudo systemctl status certbot-renew.timer
+# Check socket permissions
+ls -la /tmp/flask-app.sock
+
+# Check if Nginx can access the socket
+sudo -u nginx test -r /tmp/flask-app.sock && echo "OK" || echo "FAIL"
+
+# Check SELinux denials
+sudo ausearch -m avc -ts recent
 ```
 
-## Troubleshooting Common Issues
+## Production Optimization (Optional)
 
-**If the app doesn't start:**
+For better performance, update `uwsgi.ini`:
+
 ```bash
-# Check for port conflicts
-sudo netstat -tulpn | grep :8000
-
-# Verify Python path
-which python3
-/home/emerg1/.venv/bin/python --version
+nano /home/emerg1/shivam/uwsgi.ini
 ```
 
-**If you get permission errors:**
+```ini
+[uwsgi]
+# Application settings
+module = app:app
+chdir = /home/emerg1/shivam
+virtualenv = /home/emerg1/.venv
+
+# Process management
+master = true
+processes = 4
+threads = 2
+enable-threads = true
+
+# Socket settings
+socket = /tmp/flask-app.sock
+chmod-socket = 666
+vacuum = true
+die-on-term = true
+
+# Performance tuning
+max-requests = 1000
+max-requests-delta = 100
+harakiri = 300
+buffer-size = 32768
+
+# Logging
+logto = /home/emerg1/shivam/logs/uwsgi.log
+log-maxsize = 10000000
+log-date = true
+
+# Stats (optional - for monitoring)
+# stats = /tmp/uwsgi-stats.sock
+```
+
+Then restart:
+
 ```bash
-# Fix ownership
-sudo chown -R emerg1:emerg1 /home/emerg1/shivam
-
-# Check file permissions
-chmod +x /home/emerg1/shivam/app.py
+sudo systemctl restart flask-uwsgi
 ```
 
-This setup gives you a production-ready Flask deployment with automatic restart, logging, and proper security configurations for Red Hat Linux!
+This setup is much simpler than Gunicorn with sockets and should work reliably on Red Hat 8! Let me know how it goes.
