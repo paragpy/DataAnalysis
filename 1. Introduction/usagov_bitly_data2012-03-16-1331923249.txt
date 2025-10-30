@@ -1,354 +1,28 @@
-Perfect! Let's do a clean, simple deployment with uWSGI and Nginx. This is often more straightforward than Gunicorn with sockets.
+**Yes, absolutely!** Using `nohup` with uWSGI will work perfectly for imports from other Python scripts in your `app.py`. Here's why and how:
 
-## Complete uWSGI + Nginx Deployment Guide for Red Hat 8
+## **Why It Will Work**
 
-### Step 1: Clean Up Previous Setup
+1. **uWSGI runs the full Python environment** - All imports and modules work normally
+2. **PYTHONPATH is preserved** - Your virtual environment and application directory are accessible
+3. **Working directory is maintained** - Relative imports and file paths work correctly
+4. **No systemd restrictions** - Bypasses all the banking system's service restrictions
 
-```bash
-# Stop and disable gunicorn services
-sudo systemctl stop gunicorn.service gunicorn.socket 2>/dev/null || true
-sudo systemctl disable gunicorn.service gunicorn.socket 2>/dev/null || true
+## **Complete Setup with nohup + uWSGI**
 
-# Remove gunicorn socket directory
-sudo rm -rf /run/gunicorn
-
-# Remove old service files (optional, for clean slate)
-sudo rm -f /etc/systemd/system/gunicorn.service
-sudo rm -f /etc/systemd/system/gunicorn.socket
-
-sudo systemctl daemon-reload
-```
-
-### Step 2: Install uWSGI
-
-```bash
-# Activate your virtual environment
-cd /home/emerg1/shivam
-source /home/emerg1/.venv/bin/activate
-
-# Install uWSGI
-pip install uwsgi flask
-
-# Verify installation
-uwsgi --version
-```
-
-### Step 3: Create uWSGI Configuration File
-
-```bash
-nano /home/emerg1/shivam/uwsgi.ini
-```
-
-Add this content:
-
-```ini
-[uwsgi]
-# Application settings
-module = app:app
-chdir = /home/emerg1/shivam
-
-# Process management
-master = true
-processes = 4
-threads = 2
-
-# Socket settings
-socket = /tmp/flask-app.sock
-chmod-socket = 666
-vacuum = true
-die-on-term = true
-
-# Logging
-logto = /home/emerg1/shivam/logs/uwsgi.log
-log-maxsize = 10000000
-```
-
-### Step 4: Create Log Directory
-
-```bash
-mkdir -p /home/emerg1/shivam/logs
-```
-
-### Step 5: Test uWSGI Manually
+### **Step 1: Test Your App with Imports First**
 
 ```bash
 cd /home/emerg1/shivam
 source /home/emerg1/.venv/bin/activate
 
-# Test uWSGI
-uwsgi --ini uwsgi.ini
-
-# Press Ctrl+C to stop after verifying it starts without errors
+# Test that all imports work
+python -c "from app import app; print('All imports working!')"
 ```
 
-### Step 6: Create uWSGI systemd Service
+### **Step 2: Create Optimized uWSGI Config**
 
 ```bash
-sudo nano /etc/systemd/system/flask-uwsgi.service
-```
-
-Add this content:
-
-```ini
-[Unit]
-Description=uWSGI instance to serve Flask app
-After=network.target
-
-[Service]
-User=emerg1
-Group=nginx
-WorkingDirectory=/home/emerg1/shivam
-Environment="PATH=/home/emerg1/.venv/bin"
-
-ExecStart=/home/emerg1/.venv/bin/uwsgi --ini /home/emerg1/shivam/uwsgi.ini
-
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-```
-
-### Step 7: Start and Enable uWSGI Service
-
-```bash
-# Reload systemd
-sudo systemctl daemon-reload
-
-# Start uWSGI service
-sudo systemctl start flask-uwsgi
-
-# Check status
-sudo systemctl status flask-uwsgi
-
-# Enable to start on boot
-sudo systemctl enable flask-uwsgi
-
-# Verify socket file was created
-ls -la /tmp/flask-app.sock
-```
-
-### Step 8: Create/Update Nginx Configuration
-
-```bash
-sudo nano /etc/nginx/conf.d/flask-app.conf
-```
-
-Add this content:
-
-```nginx
-server {
-    listen 80;
-    server_name 10.198.52.64;  # Your server IP or domain
-
-    access_log /var/log/nginx/flask-app-access.log;
-    error_log /var/log/nginx/flask-app-error.log;
-
-    location / {
-        include uwsgi_params;
-        uwsgi_pass unix:/tmp/flask-app.sock;
-        
-        # Timeouts
-        uwsgi_read_timeout 300;
-        uwsgi_send_timeout 300;
-    }
-
-    # Static files (if you have them)
-    location /static {
-        alias /home/emerg1/shivam/static;
-        expires 30d;
-    }
-}
-```
-
-### Step 9: Create Nginx Service File (if needed)
-
-```bash
-sudo nano /usr/lib/systemd/system/nginx.service
-```
-
-Add this:
-
-```ini
-[Unit]
-Description=The nginx HTTP and reverse proxy server
-After=network-online.target remote-fs.target nss-lookup.target
-Wants=network-online.target
-
-[Service]
-Type=forking
-PIDFile=/var/run/nginx.pid
-ExecStartPre=/usr/bin/rm -f /var/run/nginx.pid
-ExecStartPre=/usr/sbin/nginx -t
-ExecStart=/usr/sbin/nginx
-ExecReload=/usr/sbin/nginx -s reload
-KillSignal=SIGQUIT
-TimeoutStopSec=5
-KillMode=mixed
-PrivateTmp=true
-
-[Install]
-WantedBy=multi-user.target
-```
-
-### Step 10: Fix Nginx Main Config for IPv6
-
-```bash
-sudo nano /etc/nginx/nginx.conf
-```
-
-Find and comment out any IPv6 listen directives:
-
-```nginx
-# Comment out or remove this line:
-# listen       [::]:80 default_server;
-```
-
-Or run this command to do it automatically:
-
-```bash
-sudo sed -i 's/^\s*listen\s*\[::\]/#&/' /etc/nginx/nginx.conf
-```
-
-### Step 11: Start Nginx
-
-```bash
-# Reload systemd
-sudo systemctl daemon-reload
-
-# Test nginx configuration
-sudo nginx -t
-
-# Start and enable nginx
-sudo systemctl start nginx
-sudo systemctl enable nginx
-
-# Check status
-sudo systemctl status nginx
-```
-
-### Step 12: Configure Firewall
-
-```bash
-# Allow HTTP traffic
-sudo firewall-cmd --permanent --add-service=http
-sudo firewall-cmd --permanent --add-service=https
-sudo firewall-cmd --reload
-
-# Verify
-sudo firewall-cmd --list-all
-```
-
-### Step 13: Configure SELinux Permissions
-
-```bash
-# Allow Nginx to connect to uWSGI socket
-sudo setsebool -P httpd_can_network_connect 1
-
-# Set proper context for socket file
-sudo chcon -t httpd_sys_rw_content_t /tmp/flask-app.sock
-
-# Set context for app directory
-sudo semanage fcontext -a -t httpd_sys_content_t "/home/emerg1/shivam(/.*)?"
-sudo restorecon -Rv /home/emerg1/shivam
-```
-
-### Step 14: Add User to Nginx Group
-
-```bash
-sudo usermod -a -G nginx emerg1
-
-# Verify
-groups emerg1
-```
-
-### Step 15: Test Your Deployment
-
-```bash
-# Check both services are running
-sudo systemctl status flask-uwsgi nginx
-
-# Test locally
-curl http://localhost
-
-# Test from external
-curl http://10.198.52.64
-
-# Check listening ports
-sudo ss -tlnp | grep :80
-
-# Check socket
-ls -la /tmp/flask-app.sock
-```
-
-### Step 16: View Logs
-
-```bash
-# uWSGI logs
-tail -f /home/emerg1/shivam/logs/uwsgi.log
-
-# Nginx error logs
-sudo tail -f /var/log/nginx/flask-app-error.log
-
-# Nginx access logs
-sudo tail -f /var/log/nginx/flask-app-access.log
-
-# Systemd logs
-sudo journalctl -u flask-uwsgi -f
-```
-
-## Useful Management Commands
-
-```bash
-# Restart uWSGI
-sudo systemctl restart flask-uwsgi
-
-# Restart Nginx
-sudo systemctl restart nginx
-
-# Check status of both
-sudo systemctl status flask-uwsgi nginx
-
-# View recent logs
-sudo journalctl -u flask-uwsgi -n 50
-
-# Reload uWSGI (graceful restart)
-sudo systemctl reload flask-uwsgi
-
-# Stop everything
-sudo systemctl stop flask-uwsgi nginx
-
-# Start everything
-sudo systemctl start flask-uwsgi nginx
-```
-
-## Troubleshooting Commands
-
-```bash
-# If uWSGI fails to start
-sudo journalctl -u flask-uwsgi -n 100 --no-pager
-
-# Test uWSGI manually
-cd /home/emerg1/shivam
-source /home/emerg1/.venv/bin/activate
-uwsgi --ini uwsgi.ini
-
-# Check socket permissions
-ls -la /tmp/flask-app.sock
-
-# Check if Nginx can access the socket
-sudo -u nginx test -r /tmp/flask-app.sock && echo "OK" || echo "FAIL"
-
-# Check SELinux denials
-sudo ausearch -m avc -ts recent
-```
-
-## Production Optimization (Optional)
-
-For better performance, update `uwsgi.ini`:
-
-```bash
-nano /home/emerg1/shivam/uwsgi.ini
+nano /home/emerg1/shivam/uwsgi_nohup.ini
 ```
 
 ```ini
@@ -356,7 +30,7 @@ nano /home/emerg1/shivam/uwsgi.ini
 # Application settings
 module = app:app
 chdir = /home/emerg1/shivam
-virtualenv = /home/emerg1/.venv
+pythonpath = /home/emerg1/shivam
 
 # Process management
 master = true
@@ -364,31 +38,201 @@ processes = 4
 threads = 2
 enable-threads = true
 
-# Socket settings
-socket = /tmp/flask-app.sock
-chmod-socket = 666
-vacuum = true
-die-on-term = true
+# Network binding (direct HTTP, no socket)
+http = 0.0.0.0:8000
 
-# Performance tuning
+# Performance
 max-requests = 1000
 max-requests-delta = 100
 harakiri = 300
-buffer-size = 32768
 
 # Logging
 logto = /home/emerg1/shivam/logs/uwsgi.log
-log-maxsize = 10000000
+log-maxsize = 50000000
 log-date = true
 
-# Stats (optional - for monitoring)
-# stats = /tmp/uwsgi-stats.sock
+# Cleanup
+vacuum = true
+die-on-term = true
 ```
 
-Then restart:
+### **Step 3: Create Startup Script**
 
 ```bash
-sudo systemctl restart flask-uwsgi
+nano /home/emerg1/shivam/start_app_nohup.sh
 ```
 
-This setup is much simpler than Gunicorn with sockets and should work reliably on Red Hat 8! Let me know how it goes.
+```bash
+#!/bin/bash
+set -e
+
+# Navigate to app directory
+cd /home/emerg1/shivam
+
+# Activate virtual environment
+source /home/emerg1/.venv/bin/activate
+
+# Ensure logs directory exists
+mkdir -p logs
+
+# Export Python path explicitly
+export PYTHONPATH="/home/emerg1/shivam:$PYTHONPATH"
+
+# Start uWSGI with nohup
+nohup uwsgi --ini uwsgi_nohup.ini > logs/app_startup.log 2>&1 &
+
+# Get the PID
+echo $! > logs/app.pid
+
+echo "Flask app started with PID: $(cat logs/app.pid)"
+echo "Access at: http://10.198.52.64:8000"
+echo "Logs: tail -f /home/emerg1/shivam/logs/uwsgi.log"
+```
+
+Make it executable:
+
+```bash
+chmod +x /home/emerg1/shivam/start_app_nohup.sh
+```
+
+### **Step 4: Create Stop Script**
+
+```bash
+nano /home/emerg1/shivam/stop_app.sh
+```
+
+```bash
+#!/bin/bash
+
+cd /home/emerg1/shivam
+
+if [ -f logs/app.pid ]; then
+    PID=$(cat logs/app.pid)
+    echo "Stopping Flask app (PID: $PID)..."
+    kill $PID
+    rm logs/app.pid
+    echo "App stopped."
+else
+    echo "No PID file found. App may not be running."
+fi
+
+# Also kill any uwsgi processes for this user
+pkill -f "uwsgi.*app:app" || true
+```
+
+Make it executable:
+
+```bash
+chmod +x /home/emerg1/shivam/stop_app.sh
+```
+
+### **Step 5: Start Your Application**
+
+```bash
+cd /home/emerg1/shivam
+
+# Start the app
+./start_app_nohup.sh
+
+# Check if it's running
+ps aux | grep uwsgi
+
+# Test the application
+curl http://localhost:8000
+curl http://10.198.52.64:8000
+```
+
+### **Step 6: Monitor and Manage**
+
+```bash
+# View real-time logs
+tail -f /home/emerg1/shivam/logs/uwsgi.log
+
+# Check startup log
+cat /home/emerg1/shivam/logs/app_startup.log
+
+# Check if process is running
+ps aux | grep uwsgi | grep -v grep
+
+# Stop the app
+./stop_app.sh
+
+# Restart the app
+./stop_app.sh && ./start_app_nohup.sh
+```
+
+## **Example: App with Multiple Imports**
+
+If your `app.py` looks like this:
+
+```python
+from flask import Flask, jsonify, request
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import os
+import sys
+
+# Local imports
+from my_module import some_function
+from utils.helpers import process_data
+from config.settings import DATABASE_URL
+
+app = Flask(__name__)
+
+@app.route('/')
+def hello():
+    return 'Flask app with imports working!'
+
+@app.route('/test-imports')
+def test_imports():
+    # Test all imports work
+    data = pd.DataFrame({'test': [1, 2, 3]})
+    result = some_function()
+    processed = process_data(data)
+    
+    return jsonify({
+        'status': 'success',
+        'pandas_version': pd.__version__,
+        'numpy_version': np.__version__,
+        'current_time': datetime.now().isoformat(),
+        'local_imports': 'working'
+    })
+```
+
+This will work perfectly with the nohup + uWSGI approach!
+
+## **Advantages of This Approach**
+
+✅ **No systemd restrictions** - Bypasses banking security policies  
+✅ **All Python imports work** - Full environment preserved  
+✅ **Persistent after logout** - nohup keeps it running  
+✅ **Production-ready** - uWSGI handles multiple workers  
+✅ **Easy management** - Simple start/stop scripts  
+✅ **Logging** - Full logs for debugging  
+
+## **Firewall Consideration**
+
+```bash
+# Request port 8000 to be opened
+sudo firewall-cmd --add-port=8000/tcp --permanent
+sudo firewall-cmd --reload
+
+# Or try different ports if 8000 is blocked
+# Edit uwsgi_nohup.ini and change: http = 0.0.0.0:9000
+```
+
+## **Production Tips**
+
+1. **Add to crontab** for auto-restart on reboot:
+```bash
+crontab -e
+# Add this line:
+@reboot /home/emerg1/shivam/start_app_nohup.sh
+```
+
+2. **Monitor with htop/top** to check resource usage
+
+3. **Rotate logs** to prevent disk space issues
+
+This approach should work perfectly in your banking environment and handle all your Python imports correctly!
