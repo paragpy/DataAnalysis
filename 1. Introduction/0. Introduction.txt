@@ -1,458 +1,490 @@
-Perfect! Here's the complete deployment guide using Gunicorn with Unix sockets for your Red Hat server. This is a more robust production setup.
+Perfect! Here are the complete scripts for running your Django Graph API using **Gunicorn** instead of uWSGI:
 
-## Complete Red Hat Flask Deployment with Gunicorn Socket
+## **Django Graph API with Gunicorn Scripts**
 
-### Step 1: Prepare Your Application
-
-```bash
-# Navigate to your app directory
-cd /home/emerg1/shivam
-
-# Activate virtual environment
-source /home/emerg1/.venv/bin/activate
-
-# Install required packages
-pip install gunicorn flask
-pip freeze > requirements.txt
-```
-
-### Step 2: Verify Your Flask App Structure
-
-Make sure your `app.py` has the Flask application object:
+### **Step 1: Create Gunicorn Configuration**
 
 ```bash
-cat /home/emerg1/shivam/app.py
+nano /home/emerg1/app/gunicorn_config.py
 ```
-
-It should have something like:
 
 ```python
-from flask import Flask
-
-app = Flask(__name__)
-
-@app.route('/')
-def hello():
-    return 'Hello World!'
-
-# For Gunicorn, remove or comment out:
-# if __name__ == '__main__':
-#     app.run()
-```
-
-### Step 3: Create Gunicorn Configuration File
-
-```bash
-nano /home/emerg1/shivam/gunicorn_config.py
-```
-
-Add this content:
-
-```python
-# Gunicorn configuration file
+# Gunicorn configuration for Django Graph API
 import multiprocessing
 
-# Socket binding
-bind = "unix:/run/gunicorn/gunicorn.sock"
+# Server socket
+bind = "0.0.0.0:7000"
+backlog = 2048
 
 # Worker processes
 workers = multiprocessing.cpu_count() * 2 + 1
 worker_class = 'sync'
 worker_connections = 1000
-max_requests = 100
-max_requests_jitter = 50
 timeout = 300
-keepalive = 3
+keepalive = 5
 
-# Preload app for better performance
-preload_app = True
-
-# Logging
-accesslog = '-'  # Log to stdout
-errorlog = '-'   # Log to stderr
-loglevel = 'info'
-
-# Process naming
-proc_name = 'flask_app'
-
-# Server mechanics
-daemon = False
-```
-
-### Step 4: Create Gunicorn Socket File
-
-```bash
-sudo nano /etc/systemd/system/gunicorn.socket
-```
-
-Add this content (adjusted for your user):
-
-```ini
-[Unit]
-Description=gunicorn socket
-
-[Socket]
-ListenStream=/run/gunicorn/gunicorn.sock
-SocketUser=emerg1
-SocketGroup=nginx
-SocketMode=0660
-
-[Install]
-WantedBy=sockets.target
-```
-
-### Step 5: Create Gunicorn Service File
-
-```bash
-sudo nano /etc/systemd/system/gunicorn.service
-```
-
-Add this content:
-
-```ini
-[Unit]
-Description=gunicorn daemon
-Requires=gunicorn.socket
-After=network.target
-
-[Service]
-Type=notify
-User=emerg1
-Group=nginx
-WorkingDirectory=/home/emerg1/shivam
-
-# systemd creates /run/gunicorn with correct perms
-RuntimeDirectory=gunicorn
-
-# Environment
-Environment="PATH=/home/emerg1/.venv/bin:/usr/local/bin:/usr/bin"
-Environment="PYTHONPATH=/home/emerg1/shivam"
-
-# Start Gunicorn
-ExecStart=/home/emerg1/.venv/bin/gunicorn \
-          --config /home/emerg1/shivam/gunicorn_config.py \
-          app:app
-
-# Logging
-StandardOutput=journal
-StandardError=journal
-
-# Restart policy
-Restart=on-failure
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-```
-
-### Step 6: Add User to Nginx Group
-
-```bash
-# Add emerg1 user to nginx group
-sudo usermod -a -G nginx emerg1
-
-# Verify group membership
-groups emerg1
-
-# You may need to logout and login for group changes to take effect
-```
-
-### Step 7: Start and Enable Gunicorn Socket
-
-```bash
-# Stop any existing flask-app service
-sudo systemctl stop flask-app 2>/dev/null || true
-sudo systemctl disable flask-app 2>/dev/null || true
-
-# Reload systemd
-sudo systemctl daemon-reload
-
-# Start and enable the socket
-sudo systemctl start gunicorn.socket
-sudo systemctl enable gunicorn.socket
-
-# Check socket status
-sudo systemctl status gunicorn.socket
-
-# Verify socket file was created
-sudo ls -la /run/gunicorn/
-```
-
-### Step 8: Test Socket Activation
-
-```bash
-# Check if gunicorn service is inactive (normal before first request)
-sudo systemctl status gunicorn
-
-# Test the socket with curl (this will activate the service)
-curl --unix-socket /run/gunicorn/gunicorn.sock http://localhost/
-
-# Now check gunicorn service status (should be active)
-sudo systemctl status gunicorn
-
-# Watch logs in real-time
-sudo journalctl -u gunicorn -f
-```
-
-### Step 9: Configure Nginx
-
-```bash
-sudo nano /etc/nginx/conf.d/flask-app.conf
-```
-
-Add this configuration:
-
-```nginx
-upstream flask_app {
-    server unix:/run/gunicorn/gunicorn.sock fail_timeout=0;
-}
-
-server {
-    listen 80;
-    server_name _;  # Replace with your domain or server IP
-
-    client_max_body_size 4G;
-    keepalive_timeout 5;
-
-    access_log /var/log/nginx/flask-app-access.log;
-    error_log /var/log/nginx/flask-app-error.log;
-
-    location / {
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header Host $http_host;
-        proxy_redirect off;
-        proxy_buffering off;
-
-        proxy_pass http://flask_app;
-    }
-
-    # Static files (if you have them)
-    location /static {
-        alias /home/emerg1/shivam/static;
-        expires 30d;
-        add_header Cache-Control "public, immutable";
-    }
-
-    # Media files (if you have them)
-    location /media {
-        alias /home/emerg1/shivam/media;
-        expires 30d;
-        add_header Cache-Control "public, immutable";
-    }
-}
-```
-
-### Step 10: Test and Start Nginx
-
-```bash
-# Test Nginx configuration
-sudo nginx -t
-
-# If test passes, restart Nginx
-sudo systemctl restart nginx
-sudo systemctl enable nginx
-
-# Check Nginx status
-sudo systemctl status nginx
-```
-
-### Step 11: Configure Firewall
-
-```bash
-# Allow HTTP and HTTPS
-sudo firewall-cmd --permanent --add-service=http
-sudo firewall-cmd --permanent --add-service=https
-sudo firewall-cmd --reload
-
-# Verify
-sudo firewall-cmd --list-all
-```
-
-### Step 12: Configure SELinux (Red Hat Specific)
-
-```bash
-# Allow Nginx to connect to the socket
-sudo setsebool -P httpd_can_network_connect 1
-
-# Set proper SELinux context for socket directory
-sudo semanage fcontext -a -t httpd_sys_rw_content_t "/run/gunicorn(/.*)?"
-sudo restorecon -Rv /run/gunicorn
-
-# Set context for application directory
-sudo semanage fcontext -a -t httpd_sys_content_t "/home/emerg1/shivam(/.*)?"
-sudo restorecon -Rv /home/emerg1/shivam
-
-# If you get "command not found" for semanage, install it:
-# sudo dnf install policycoreutils-python-utils -y
-```
-
-### Step 13: Test Your Deployment
-
-```bash
-# Test via Unix socket directly
-curl --unix-socket /run/gunicorn/gunicorn.sock http://localhost/
-
-# Test via Nginx (localhost)
-curl http://localhost
-
-# Test from external
-curl http://YOUR_SERVER_IP
-
-# Or open in browser:
-# http://YOUR_SERVER_IP
-```
-
-### Step 14: Monitor and Debug
-
-```bash
-# View all logs in real-time
-sudo journalctl -u gunicorn -u nginx -f
-
-# Check socket status
-sudo systemctl status gunicorn.socket
-
-# Check service status
-sudo systemctl status gunicorn
-
-# Check Nginx status
-sudo systemctl status nginx
-
-# View recent Gunicorn logs
-sudo journalctl -u gunicorn -n 50 --no-pager
-
-# View Nginx error logs
-sudo tail -f /var/log/nginx/flask-app-error.log
-
-# View Nginx access logs
-sudo tail -f /var/log/nginx/flask-app-access.log
-```
-
-## Useful Management Commands
-
-```bash
-# Restart Gunicorn
-sudo systemctl restart gunicorn
-
-# Restart socket (rarely needed)
-sudo systemctl restart gunicorn.socket
-
-# Restart Nginx
-sudo systemctl restart nginx
-
-# Reload Gunicorn (graceful restart without dropping connections)
-sudo systemctl reload gunicorn
-
-# Stop everything
-sudo systemctl stop gunicorn nginx
-
-# Start everything
-sudo systemctl start gunicorn.socket nginx
-
-# Check if services are enabled
-sudo systemctl is-enabled gunicorn.socket gunicorn nginx
-```
-
-## Troubleshooting Commands
-
-```bash
-# Check if socket file exists
-ls -la /run/gunicorn/
-
-# Check socket permissions
-sudo stat /run/gunicorn/gunicorn.sock
-
-# Test if Nginx can reach the socket
-sudo -u nginx curl --unix-socket /run/gunicorn/gunicorn.sock http://localhost/
-
-# Check for SELinux denials
-sudo ausearch -m avc -ts recent
-
-# Verify user groups
-id emerg1
-id nginx
-
-# Check listening sockets
-sudo ss -xl | grep gunicorn
-```
-
-## Performance Tuning
-
-Edit the gunicorn_config.py for better performance:
-
-```bash
-nano /home/emerg1/shivam/gunicorn_config.py
-```
-
-```python
-import multiprocessing
-
-bind = "unix:/run/gunicorn/gunicorn.sock"
-
-# Adjust workers based on your needs
-# Formula: (2 x $num_cores) + 1
-workers = multiprocessing.cpu_count() * 2 + 1
-
-# For CPU-bound apps, use sync
-# For I/O-bound apps, consider gevent or eventlet
-worker_class = 'sync'
-
-# Restart workers after serving this many requests (prevents memory leaks)
+# Restart workers after this many requests (prevents memory leaks)
 max_requests = 1000
 max_requests_jitter = 50
 
-# Timeout for workers
-timeout = 300
-
-# Keep-alive
-keepalive = 5
-
-# Preload app for faster worker spawning
-preload_app = True
-
 # Logging
-accesslog = '-'
-errorlog = '-'
+accesslog = '/home/emerg1/app/logs/gunicorn_access.log'
+errorlog = '/home/emerg1/app/logs/gunicorn_error.log'
 loglevel = 'info'
+access_log_format = '%(h)s %(l)s %(u)s %(t)s "%(r)s" %(s)s %(b)s "%(f)s" "%(a)s" %(D)s'
 
-# Graceful timeout
-graceful_timeout = 30
+# Process naming
+proc_name = 'django_graph_api'
+
+# Server mechanics
+daemon = False
+preload_app = True
 ```
 
-After making changes:
+### **Step 2: Create Django Startup Script with Gunicorn**
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl restart gunicorn
+nano /home/emerg1/app/start_django_gunicorn.sh
 ```
 
-Your Flask application is now deployed with a production-ready setup using Gunicorn and Unix sockets! 🚀
+```bash
+#!/bin/bash
+set -e
 
+echo "Starting Django Graph API with Gunicorn..."
 
+# Navigate to Django app directory
+cd /home/emerg1/app
 
+# Activate virtual environment
+source /home/emerg1/.venv/bin/activate
 
-sudo nano /etc/systemd/system/nginx.service
+# Ensure logs directory exists
+mkdir -p logs
 
-[Unit]
-Description=The nginx HTTP and reverse proxy server
-After=network.target remote-fs.target nss-lookup.target
+# Export Django settings and Python path for graph_api
+export DJANGO_SETTINGS_MODULE=graph_api.settings
+export PYTHONPATH="/home/emerg1/app:$PYTHONPATH"
 
-[Service]
-Type=forking
-PIDFile=/run/nginx.pid
-ExecStartPre=/usr/bin/rm -f /run/nginx.pid
-ExecStartPre=/usr/sbin/nginx -t
-ExecStart=/usr/sbin/nginx
-ExecReload=/bin/kill -s HUP $MAINPID
-KillSignal=SIGQUIT
-TimeoutStopSec=5
-KillMode=mixed
-PrivateTmp=true
+# Check if manage.py exists
+if [ ! -f manage.py ]; then
+    echo "Error: manage.py not found in /home/emerg1/app"
+    exit 1
+fi
 
-[Install]
-WantedBy=multi-user.target
+# Check if Gunicorn is installed
+if ! command -v gunicorn &> /dev/null; then
+    echo "Installing Gunicorn..."
+    pip install gunicorn
+fi
 
-sudo systemctl daemon-reload
-sudo systemctl start nginx
-sudo systemctl enable nginx
-sudo systemctl status nginx
+# Run Django management commands
+echo "Running Django migrations..."
+python manage.py migrate --noinput
+
+echo "Collecting static files..."
+python manage.py collectstatic --noinput --clear
+
+echo "Creating Django superuser (if needed)..."
+python manage.py shell -c "
+from django.contrib.auth import get_user_model
+User = get_user_model()
+if not User.objects.filter(username='admin').exists():
+    User.objects.create_superuser('admin', 'admin@example.com', 'admin123')
+    print('Superuser created: admin/admin123')
+else:
+    print('Superuser already exists')
+" || true
+
+# Start Django Graph API with Gunicorn using nohup
+echo "Starting Django Graph API with Gunicorn..."
+nohup gunicorn \
+    --config gunicorn_config.py \
+    graph_api.wsgi:application \
+    > logs/django_startup.log 2>&1 &
+
+# Get the PID
+DJANGO_PID=$!
+echo $DJANGO_PID > logs/django.pid
+
+echo "================================"
+echo "Django Graph API started successfully!"
+echo "PID: $DJANGO_PID"
+echo "URL: http://10.198.52.64:7000"
+echo "Admin: http://10.198.52.64:7000/admin"
+echo "API Docs: http://10.198.52.64:7000/api/"
+echo "Graph API: http://10.198.52.64:7000/graph/"
+echo "================================"
+echo "Useful commands:"
+echo "  View access logs: tail -f /home/emerg1/app/logs/gunicorn_access.log"
+echo "  View error logs: tail -f /home/emerg1/app/logs/gunicorn_error.log"
+echo "  Check process: ps aux | grep gunicorn"
+echo "  Stop app: ./stop_django_gunicorn.sh"
+echo "================================"
+```
+
+Make it executable:
+
+```bash
+chmod +x /home/emerg1/app/start_django_gunicorn.sh
+```
+
+### **Step 3: Create Django Stop Script**
+
+```bash
+nano /home/emerg1/app/stop_django_gunicorn.sh
+```
+
+```bash
+#!/bin/bash
+
+echo "Stopping Django Graph API (Gunicorn)..."
+
+cd /home/emerg1/app
+
+# Stop using PID file
+if [ -f logs/django.pid ]; then
+    PID=$(cat logs/django.pid)
+    echo "Stopping Django Graph API (PID: $PID)..."
+    
+    # Try graceful shutdown first
+    kill -TERM $PID 2>/dev/null || true
+    sleep 5
+    
+    # Check if process is still running
+    if ps -p $PID > /dev/null 2>&1; then
+        echo "Process still running, force killing..."
+        kill -KILL $PID 2>/dev/null || true
+    fi
+    
+    rm logs/django.pid
+    echo "Django Graph API stopped via PID."
+else
+    echo "No PID file found."
+fi
+
+# Also kill any Django gunicorn processes for this user
+echo "Cleaning up any remaining gunicorn processes..."
+pkill -f "gunicorn.*graph_api.wsgi" || true
+pkill -f "gunicorn.*7000" || true
+
+# Check if any processes are still running
+REMAINING=$(ps aux | grep -E "(gunicorn.*7000|gunicorn.*graph_api.wsgi)" | grep -v grep | wc -l)
+if [ $REMAINING -eq 0 ]; then
+    echo "Django Graph API stopped successfully."
+else
+    echo "Warning: Some gunicorn processes may still be running."
+    ps aux | grep -E "(gunicorn.*7000|gunicorn.*graph_api.wsgi)" | grep -v grep
+fi
+```
+
+Make it executable:
+
+```bash
+chmod +x /home/emerg1/app/stop_django_gunicorn.sh
+```
+
+### **Step 4: Create Django Management Script**
+
+```bash
+nano /home/emerg1/app/manage_django_gunicorn.sh
+```
+
+```bash
+#!/bin/bash
+
+cd /home/emerg1/app
+source /home/emerg1/.venv/bin/activate
+
+# Set Django settings for graph_api
+export DJANGO_SETTINGS_MODULE=graph_api.settings
+
+case $1 in
+    start)
+        echo "Starting Django Graph API with Gunicorn..."
+        ./start_django_gunicorn.sh
+        ;;
+    stop)
+        echo "Stopping Django Graph API..."
+        ./stop_django_gunicorn.sh
+        ;;
+    restart)
+        echo "Restarting Django Graph API..."
+        ./stop_django_gunicorn.sh
+        sleep 3
+        ./start_django_gunicorn.sh
+        ;;
+    reload)
+        echo "Gracefully reloading Django Graph API..."
+        if [ -f logs/django.pid ]; then
+            PID=$(cat logs/django.pid)
+            echo "Sending HUP signal to reload workers (PID: $PID)..."
+            kill -HUP $PID 2>/dev/null || true
+            echo "Reload signal sent."
+        else
+            echo "No PID file found. Use 'restart' instead."
+        fi
+        ;;
+    status)
+        echo "Django Graph API Status (Gunicorn):"
+        if [ -f logs/django.pid ]; then
+            PID=$(cat logs/django.pid)
+            if ps -p $PID > /dev/null; then
+                echo "✓ Running (PID: $PID)"
+                echo "✓ URL: http://10.198.52.64:7000"
+                
+                # Show worker processes
+                echo "✓ Worker processes:"
+                ps aux | grep -E "(gunicorn.*graph_api.wsgi)" | grep -v grep
+            else
+                echo "✗ PID file exists but process not running"
+            fi
+        else
+            echo "✗ Not running (no PID file)"
+        fi
+        
+        # Check listening ports
+        if netstat -tlnp 2>/dev/null | grep -q :7000; then
+            echo "✓ Port 7000 is listening"
+        else
+            echo "✗ Port 7000 is not listening"
+        fi
+        ;;
+    logs)
+        echo "Viewing Django Graph API logs (Press Ctrl+C to exit):"
+        echo "Choose log type:"
+        echo "1) Error logs"
+        echo "2) Access logs"
+        echo "3) Both (split screen)"
+        read -p "Enter choice (1-3): " choice
+        
+        case $choice in
+            1)
+                tail -f logs/gunicorn_error.log
+                ;;
+            2)
+                tail -f logs/gunicorn_access.log
+                ;;
+            3)
+                echo "Opening both logs..."
+                tail -f logs/gunicorn_error.log logs/gunicorn_access.log
+                ;;
+            *)
+                echo "Invalid choice. Showing error logs..."
+                tail -f logs/gunicorn_error.log
+                ;;
+        esac
+        ;;
+    shell)
+        echo "Opening Django shell..."
+        python manage.py shell
+        ;;
+    migrate)
+        echo "Running Django migrations..."
+        python manage.py migrate
+        ;;
+    test)
+        echo "Testing Django Graph API..."
+        echo "Testing root endpoint:"
+        curl -s -o /dev/null -w "HTTP %{http_code} - Response time: %{time_total}s\n" http://localhost:7000/
+        
+        echo "Testing admin endpoint:"
+        curl -s -o /dev/null -w "HTTP %{http_code} - Response time: %{time_total}s\n" http://localhost:7000/admin/
+        
+        echo "Graph API test completed."
+        ;;
+    dbshell)
+        echo "Opening Django database shell..."
+        python manage.py dbshell
+        ;;
+    workers)
+        echo "Gunicorn worker processes:"
+        ps aux | grep -E "(gunicorn.*graph_api.wsgi)" | grep -v grep || echo "No workers found"
+        ;;
+    *)
+        echo "Django Graph API Management Script (Gunicorn)"
+        echo "Usage: $0 {start|stop|restart|reload|status|logs|shell|migrate|test|dbshell|workers}"
+        echo ""
+        echo "Commands:"
+        echo "  start   - Start Django Graph API"
+        echo "  stop    - Stop Django Graph API"
+        echo "  restart - Restart Django Graph API"
+        echo "  reload  - Gracefully reload workers (no downtime)"
+        echo "  status  - Check if API is running"
+        echo "  logs    - View real-time logs"
+        echo "  shell   - Open Django shell"
+        echo "  migrate - Run database migrations"
+        echo "  test    - Test API endpoints"
+        echo "  dbshell - Open database shell"
+        echo "  workers - Show gunicorn worker processes"
+        ;;
+esac
+```
+
+Make it executable:
+
+```bash
+chmod +x /home/emerg1/app/manage_django_gunicorn.sh
+```
+
+### **Step 5: Create Setup Check Script for Gunicorn**
+
+```bash
+nano /home/emerg1/app/check_django_gunicorn_setup.sh
+```
+
+```bash
+#!/bin/bash
+
+echo "Checking Django Graph API setup for Gunicorn..."
+
+cd /home/emerg1/app
+source /home/emerg1/.venv/bin/activate
+
+# Set Django settings
+export DJANGO_SETTINGS_MODULE=graph_api.settings
+
+# Check if Django is installed
+echo "1. Checking Django installation..."
+python -c "import django; print(f'Django version: {django.get_version()}')" || {
+    echo "Django not found. Installing..."
+    pip install django djangorestframework gunicorn
+}
+
+# Check if Gunicorn is installed
+echo "2. Checking Gunicorn installation..."
+python -c "import gunicorn; print(f'Gunicorn version: {gunicorn.__version__}')" || {
+    echo "Gunicorn not found. Installing..."
+    pip install gunicorn
+}
+
+# Check if manage.py exists
+echo "3. Checking manage.py..."
+if [ -f manage.py ]; then
+    echo "✓ manage.py found"
+else
+    echo "✗ manage.py not found in /home/emerg1/app"
+    exit 1
+fi
+
+# Check if graph_api directory exists
+echo "4. Checking graph_api directory..."
+if [ -d graph_api ]; then
+    echo "✓ graph_api directory found"
+    if [ -f graph_api/settings.py ]; then
+        echo "✓ graph_api/settings.py found"
+    else
+        echo "✗ graph_api/settings.py not found"
+        exit 1
+    fi
+    if [ -f graph_api/wsgi.py ]; then
+        echo "✓ graph_api/wsgi.py found"
+    else
+        echo "✗ graph_api/wsgi.py not found"
+        exit 1
+    fi
+else
+    echo "✗ graph_api directory not found in /home/emerg1/app"
+    exit 1
+fi
+
+# Test Gunicorn can load the application
+echo "5. Testing Gunicorn can load the application..."
+gunicorn --check-config --config gunicorn_config.py graph_api.wsgi:application || {
+    echo "Warning: Gunicorn config check failed, but continuing..."
+}
+
+# Check Django settings
+echo "6. Checking Django settings..."
+python manage.py check --deploy || {
+    echo "Django check failed. Continuing anyway..."
+}
+
+# Check database
+echo "7. Checking database..."
+python -c "
+import django
+django.setup()
+from django.db import connection
+print(f'Database: {connection.settings_dict[\"ENGINE\"]}')
+" || echo "Database check failed, but continuing..."
+
+echo "✓ Django Graph API with Gunicorn setup check completed!"
+echo ""
+echo "Ready to start with: ./manage_django_gunicorn.sh start"
+```
+
+Make it executable:
+
+```bash
+chmod +x /home/emerg1/app/check_django_gunicorn_setup.sh
+```
+
+## **Usage Instructions**
+
+### **Step 1: Setup and Check Environment**
+
+```bash
+cd /home/emerg1/app
+
+# Check setup
+./check_django_gunicorn_setup.sh
+
+# Install Gunicorn if needed
+source /home/emerg1/.venv/bin/activate
+pip install gunicorn
+```
+
+### **Step 2: Start Django Graph API**
+
+```bash
+# Start the API
+./manage_django_gunicorn.sh start
+
+# Check status
+./manage_django_gunicorn.sh status
+```
+
+### **Step 3: Test the API**
+
+```bash
+# Test endpoints
+./manage_django_gunicorn.sh test
+
+# View logs
+./manage_django_gunicorn.sh logs
+
+# Check worker processes
+./manage_django_gunicorn.sh workers
+```
+
+### **Step 4: Manage the API**
+
+```bash
+# Graceful reload (no downtime)
+./manage_django_gunicorn.sh reload
+
+# Full restart
+./manage_django_gunicorn.sh restart
+
+# Stop
+./manage_django_gunicorn.sh stop
+```
+
+## **Firewall Configuration**
+
+```bash
+# Open port 7000
+sudo firewall-cmd --add-port=7000/tcp --permanent
+sudo firewall-cmd --reload
+```
+
+## **Advantages of Gunicorn over uWSGI**
+
+✅ **Simpler configuration** - Less complex than uWSGI  
+✅ **Better Django integration** - Built specifically for WSGI apps  
+✅ **Graceful reloading** - Zero-downtime deployments with `reload` command  
+✅ **Better process management** - Master/worker architecture  
+✅ **Easier debugging** - Clearer error messages
+
+Your Django Graph API will now run on **http://10.198.52.64:7000** using Gunicorn!​​​​​​​​​​​​​​​​
