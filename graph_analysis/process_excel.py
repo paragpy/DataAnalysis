@@ -79,8 +79,23 @@ def process_workbook(input_path: str, output_path: str | None = None) -> str:
 
     output_path = output_path or _resolve_output_path(input_path)
 
+    # Echo the configuration in use so a run is self-documenting.
+    print("=" * 70)
+    print("Swoosh Graph Analysis")
+    print("=" * 70)
+    print(f"  Input file   : {input_path}")
+    print(f"  Input sheet  : {config.INPUT_SHEET_NAME!r}")
+    print(f"  Output file  : {output_path}")
+    print(f"  Result sheet : {config.RESULT_SHEET_NAME!r}")
+    print(f"  API endpoint : {config.BASE_URL.rstrip('/') + config.NODES_ENDPOINT}")
+    print(f"  space_name   : {config.SPACE_NAME}")
+    print(f"  Job id column: {config.SWOOSH_JOB_ID_COLUMN!r}")
+    print("=" * 70)
+
     # Read the job list from the "Jobs and JobID" sheet.
+    print(f"Reading sheet {config.INPUT_SHEET_NAME!r} from {input_path} ...")
     df = pd.read_excel(input_path, sheet_name=config.INPUT_SHEET_NAME)
+    print(f"  Loaded {len(df)} row(s); columns: {list(df.columns)}")
 
     if config.SWOOSH_JOB_ID_COLUMN not in df.columns:
         raise KeyError(
@@ -92,6 +107,7 @@ def process_workbook(input_path: str, output_path: str | None = None) -> str:
     # swoosh_job_id) as the basis for the result sheet.
     keep = [c for c in config.KEEP_COLUMNS if c in df.columns]
     result = df[keep].copy() if keep else df.copy()
+    print(f"  Keeping initial columns: {keep or list(df.columns)}")
 
     # Discover which tags actually need columns: the known ones always, plus any
     # unknown tags we encounter (if enabled).
@@ -102,42 +118,58 @@ def process_workbook(input_path: str, output_path: str | None = None) -> str:
     per_row_counts: List[Counter] = []
     per_row_json: List[str] = []
 
+    # Run-wide tallies for the closing summary.
+    overall_counts: Counter = Counter()
+    ok_rows = 0
+    skipped_rows = 0
+    error_rows = 0
+
     total = len(df)
-    print(f"Processing {total} row(s) from {input_path}")
+    print(f"\nCalling graph API for {total} row(s) ...")
 
     for idx, raw_job_id in enumerate(df[config.SWOOSH_JOB_ID_COLUMN], start=1):
         job_id = "" if pd.isna(raw_job_id) else str(raw_job_id).strip()
 
         if not job_id:
-            print(f"  [{idx}/{total}] skipped — empty swoosh_job_id")
+            print(f"  [{idx}/{total}] SKIPPED — empty {config.SWOOSH_JOB_ID_COLUMN}")
+            skipped_rows += 1
             per_row_counts.append(Counter())
             per_row_json.append(json.dumps([]))
             continue
 
         try:
+            print(f"  [{idx}/{total}] {job_id} -> requesting ...")
             nodes = fetch_nodes(job_id)
             tag_counts, bundle = _summarise_nodes(nodes)
             per_row_counts.append(tag_counts)
             per_row_json.append(json.dumps(bundle, ensure_ascii=False))
+            overall_counts.update(tag_counts)
+            ok_rows += 1
 
             # Track any tags outside the known list so they still get a column.
             if config.INCLUDE_UNKNOWN_TAGS:
                 for tag in tag_counts:
                     if tag not in known_tags and tag not in extra_tags:
                         extra_tags.append(tag)
+                        print(f"        note: new tag {tag!r} not in POSSIBLE_TAGS")
 
+            # Show the per-tag breakdown for this row.
+            breakdown = ", ".join(f"{t}={c}" for t, c in sorted(tag_counts.items()))
             print(
                 f"  [{idx}/{total}] {job_id} -> {len(nodes)} node(s), "
                 f"{len(tag_counts)} distinct tag(s)"
+                + (f" [{breakdown}]" if breakdown else "")
             )
         except GraphAPIError as exc:
             # Record the error inline rather than aborting the whole run.
             print(f"  [{idx}/{total}] {job_id} -> ERROR: {exc}")
+            error_rows += 1
             per_row_counts.append(Counter())
             per_row_json.append(json.dumps({"error": str(exc)}, ensure_ascii=False))
 
     # Build the count columns (one per tag) before the JSON column.
     tag_columns = known_tags + sorted(extra_tags)
+    print(f"\nWriting {len(tag_columns)} tag column(s) + {config.GRAPH_DETAILS_COLUMN!r}")
     for tag in tag_columns:
         result[tag] = [counts.get(tag, 0) for counts in per_row_counts]
 
@@ -145,6 +177,23 @@ def process_workbook(input_path: str, output_path: str | None = None) -> str:
     result[config.GRAPH_DETAILS_COLUMN] = per_row_json
 
     _write_result_sheet(input_path, output_path, result)
+
+    # Closing summary.
+    print("\n" + "-" * 70)
+    print("Summary")
+    print("-" * 70)
+    print(f"  Rows processed : {total}")
+    print(f"    succeeded    : {ok_rows}")
+    print(f"    skipped      : {skipped_rows}")
+    print(f"    errored      : {error_rows}")
+    print("  Total nodes by tag (across all rows):")
+    if overall_counts:
+        for tag in tag_columns:
+            if overall_counts.get(tag):
+                print(f"    {tag:<28}: {overall_counts[tag]}")
+    else:
+        print("    (none)")
+    print("-" * 70)
     print(
         f"Done. Wrote sheet {config.RESULT_SHEET_NAME!r} to {output_path} "
         f"(original sheets preserved)."

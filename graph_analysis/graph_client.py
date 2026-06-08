@@ -91,13 +91,19 @@ def fetch_nodes(swoosh_job_id: str) -> List[Dict[str, Any]]:
                 timeout=config.REQUEST_TIMEOUT,
                 verify=config.VERIFY_SSL,
             )
+            print(f"        GET {response.url} -> HTTP {response.status_code}")
             response.raise_for_status()
             return _extract_nodes(response.json())
         except (requests.RequestException, ValueError) as exc:
             last_error = exc
             # Don't sleep after the final attempt.
             if attempt < config.MAX_RETRIES - 1:
-                time.sleep(config.RETRY_BACKOFF_SECONDS * (2 ** attempt))
+                wait = config.RETRY_BACKOFF_SECONDS * (2 ** attempt)
+                print(
+                    f"        attempt {attempt + 1}/{config.MAX_RETRIES} failed "
+                    f"({exc}); retrying in {wait}s ..."
+                )
+                time.sleep(wait)
 
     raise GraphAPIError(
         f"Failed to fetch nodes for swoosh_job_id={swoosh_job_id!r}: {last_error}"
