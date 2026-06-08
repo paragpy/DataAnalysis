@@ -65,15 +65,19 @@ pip install -r requirements.txt
 ## Run
 
 ```bash
-# Output written next to the input as <name>_graph_analysis.xlsx
-python process_excel.py "/path/to/20260608_ClauseAnalysis Status.xlsx"
+# No arguments: uses job_ids_list.xlsx located in the same folder as the code
+python process_excel.py
 
-# Or specify an explicit output path
+# Or pass an explicit input (output written next to it as <name>_graph_analysis.xlsx)
+python process_excel.py "/path/to/input.xlsx"
+
+# Or specify an explicit output path too
 python process_excel.py "/path/to/input.xlsx" "/path/to/output.xlsx"
 ```
 
-Only the Excel path(s) are passed at runtime; everything else is configured in
-`config.py`.
+By default the tool reads `job_ids_list.xlsx` from its own folder (configurable
+via `INPUT_FILENAME` in `config.py`). Everything else is configured in
+`config.py`; the Excel path is optional on the command line.
 
 ## Output layout
 

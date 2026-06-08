@@ -60,6 +60,10 @@ RETRY_BACKOFF_SECONDS = 2  # 2, 4, 8, 16 ...
 # Name of the column in the input workbook that holds the swoosh job id.
 SWOOSH_JOB_ID_COLUMN = "swoosh_job_id"
 
+# Default input workbook. When no path is passed on the command line, the tool
+# looks for this file in the same folder as the code.
+INPUT_FILENAME = "job_ids_list.xlsx"
+
 # Sheet to read the job list from (the "Jobs and JobID" tab).
 INPUT_SHEET_NAME = "Jobs and JobID"
 

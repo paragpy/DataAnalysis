@@ -2,7 +2,8 @@
 Swoosh Graph Analysis — Excel enrichment tool.
 
 Usage:
-    python process_excel.py /path/to/ClauseAnalysis_Status.xlsx
+    python process_excel.py                       # uses job_ids_list.xlsx next to this script
+    python process_excel.py /path/to/input.xlsx
     python process_excel.py /path/to/input.xlsx /path/to/output.xlsx
 
 The tool reads the job list from the "Jobs and JobID" sheet and, for every row:
@@ -33,6 +34,14 @@ import pandas as pd
 
 import config
 from graph_client import GraphAPIError, fetch_nodes
+
+# Directory containing this script — used to locate the default input file.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _default_input_path() -> str:
+    """Path to the default workbook (config.INPUT_FILENAME) beside this script."""
+    return os.path.join(SCRIPT_DIR, config.INPUT_FILENAME)
 
 
 def _resolve_output_path(input_path: str) -> str:
@@ -164,12 +173,9 @@ def _write_result_sheet(input_path: str, output_path: str, result: pd.DataFrame)
 
 
 def main(argv: List[str]) -> int:
-    if len(argv) < 2:
-        print(__doc__)
-        print("Error: path to the Excel workbook is required.", file=sys.stderr)
-        return 2
-
-    input_path = argv[1]
+    # The input path is optional: default to config.INPUT_FILENAME next to this
+    # script when not provided.
+    input_path = argv[1] if len(argv) > 1 else _default_input_path()
     output_path = argv[2] if len(argv) > 2 else None
 
     try:
