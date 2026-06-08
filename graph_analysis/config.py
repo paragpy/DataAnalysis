@@ -60,6 +60,17 @@ RETRY_BACKOFF_SECONDS = 2  # 2, 4, 8, 16 ...
 # Name of the column in the input workbook that holds the swoosh job id.
 SWOOSH_JOB_ID_COLUMN = "swoosh_job_id"
 
+# Sheet to read the job list from (the "Jobs and JobID" tab).
+INPUT_SHEET_NAME = "Jobs and JobID"
+
+# Name of the new sheet that receives our enriched result. Any existing sheets
+# in the workbook (e.g. "CW_level_data") are preserved.
+RESULT_SHEET_NAME = "graph_analysis_result"
+
+# Columns from the input sheet to carry into the result sheet (kept before the
+# tag count columns). These are the first three columns of "Jobs and JobID".
+KEEP_COLUMNS = ["contract_id", "sb_job_id", "swoosh_job_id"]
+
 # Optional explicit output path. When None, the tool writes alongside the input
 # file using the input name with an "_graph_analysis" suffix.
 OUTPUT_PATH = None

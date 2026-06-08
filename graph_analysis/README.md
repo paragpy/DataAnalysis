@@ -3,8 +3,14 @@
 Enriches an Excel workbook with node/tag information pulled from the Swoosh
 **Get Nodes - Bundle** graph API.
 
-For every row in the workbook the tool reads the `swoosh_job_id`, calls the
-graph API, collects every returned node's `(tag, vid)` pair, and writes:
+The tool reads the job list from the **`Jobs and JobID`** sheet and, for every
+row, reads the `swoosh_job_id`, calls the graph API, collects every returned
+node's `(tag, vid)` pair, and writes the output to a **new sheet**
+(`graph_analysis_result`) that keeps the original three columns
+(`contract_id`, `sb_job_id`, `swoosh_job_id`). All existing sheets in the
+workbook (e.g. `CW_level_data`) are preserved.
+
+Each result row contains:
 
 - **one count column per possible tag** (how many nodes of that tag the job
   produced), and
@@ -71,8 +77,10 @@ Only the Excel path(s) are passed at runtime; everything else is configured in
 
 ## Output layout
 
+A new sheet `graph_analysis_result` is added to the workbook:
+
 ```
-<original columns...> | CWID | MasterAgreement | ... | Clause | graph_details_json
+contract_id | sb_job_id | swoosh_job_id | CWID | MasterAgreement | ... | Clause | graph_details_json
 ```
 
 Where each tag column holds the per-row node count for that tag and

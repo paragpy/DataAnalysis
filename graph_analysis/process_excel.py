@@ -5,12 +5,16 @@ Usage:
     python process_excel.py /path/to/ClauseAnalysis_Status.xlsx
     python process_excel.py /path/to/input.xlsx /path/to/output.xlsx
 
-For every row in the workbook this tool:
+The tool reads the job list from the "Jobs and JobID" sheet and, for every row:
   1. reads the `swoosh_job_id`,
   2. calls the Swoosh graph API (Get Nodes - Bundle),
   3. collects every node's (tag, vid) pair,
   4. writes one count column per possible tag, and
   5. appends a final column with the full (tag, vid) bundle as a JSON string.
+
+The result is written to a NEW sheet ("graph_analysis_result") that keeps the
+original three columns (contract_id, sb_job_id, swoosh_job_id). All existing
+sheets in the workbook (e.g. "CW_level_data") are preserved.
 
 All connection settings live in config.py; only the Excel path(s) are passed
 on the command line.
@@ -20,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 from collections import Counter
 from typing import Any, Dict, List
@@ -65,13 +70,19 @@ def process_workbook(input_path: str, output_path: str | None = None) -> str:
 
     output_path = output_path or _resolve_output_path(input_path)
 
-    df = pd.read_excel(input_path)
+    # Read the job list from the "Jobs and JobID" sheet.
+    df = pd.read_excel(input_path, sheet_name=config.INPUT_SHEET_NAME)
 
     if config.SWOOSH_JOB_ID_COLUMN not in df.columns:
         raise KeyError(
-            f"Column {config.SWOOSH_JOB_ID_COLUMN!r} not found in workbook. "
-            f"Available columns: {list(df.columns)}"
+            f"Column {config.SWOOSH_JOB_ID_COLUMN!r} not found in sheet "
+            f"{config.INPUT_SHEET_NAME!r}. Available columns: {list(df.columns)}"
         )
+
+    # Keep only the configured initial columns (contract_id, sb_job_id,
+    # swoosh_job_id) as the basis for the result sheet.
+    keep = [c for c in config.KEEP_COLUMNS if c in df.columns]
+    result = df[keep].copy() if keep else df.copy()
 
     # Discover which tags actually need columns: the known ones always, plus any
     # unknown tags we encounter (if enabled).
@@ -119,14 +130,37 @@ def process_workbook(input_path: str, output_path: str | None = None) -> str:
     # Build the count columns (one per tag) before the JSON column.
     tag_columns = known_tags + sorted(extra_tags)
     for tag in tag_columns:
-        df[tag] = [counts.get(tag, 0) for counts in per_row_counts]
+        result[tag] = [counts.get(tag, 0) for counts in per_row_counts]
 
     # The (tag, vid) bundle JSON string goes in the very last column.
-    df[config.GRAPH_DETAILS_COLUMN] = per_row_json
+    result[config.GRAPH_DETAILS_COLUMN] = per_row_json
 
-    df.to_excel(output_path, index=False)
-    print(f"Done. Wrote enriched workbook to {output_path}")
+    _write_result_sheet(input_path, output_path, result)
+    print(
+        f"Done. Wrote sheet {config.RESULT_SHEET_NAME!r} to {output_path} "
+        f"(original sheets preserved)."
+    )
     return output_path
+
+
+def _write_result_sheet(input_path: str, output_path: str, result: pd.DataFrame) -> None:
+    """
+    Write `result` into a new sheet while keeping every existing sheet.
+
+    The source workbook is copied to the output path first (so all original
+    sheets — e.g. "CW_level_data" — are preserved), then the result sheet is
+    appended/replaced in place.
+    """
+    if os.path.abspath(input_path) != os.path.abspath(output_path):
+        shutil.copyfile(input_path, output_path)
+
+    with pd.ExcelWriter(
+        output_path,
+        engine="openpyxl",
+        mode="a",
+        if_sheet_exists="replace",
+    ) as writer:
+        result.to_excel(writer, sheet_name=config.RESULT_SHEET_NAME, index=False)
 
 
 def main(argv: List[str]) -> int:
