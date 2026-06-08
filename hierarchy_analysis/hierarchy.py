@@ -1,15 +1,18 @@
 """
 Hierarchy construction for a single CWID, using the real graph edge model.
 
-Traversal (all reads, depth 1 per the API behaviour):
+Traversal (a single depth-2 read per CWID):
 
   1. Fetch the CWID node by vid (vid == contract_id) with get_edges=true,
-     depth=1. Its edges give:
-        * outward HAS_DOCUMENT -> the documents that belong to the CWID
-        * inward  HAS_BUNDLE   -> the bundle(s) the CWID belongs to
-  2. For each document, fetch it by vid (depth 1) and read its CHILD_OF edges to
-     discover which OTHER documents it connects to (chunks are excluded).
-  3. Fetch each bundle by vid for its identity + clause fields.
+     depth=2. The one response carries:
+        * the CWID's edges: outward HAS_DOCUMENT -> its documents, and
+          inward HAS_BUNDLE -> the bundle(s) it belongs to;
+        * each document's nested edges (inside destination_node): CHILD_OF to
+          other documents and IN_BUNDLE to its bundle node (clause fields
+          inline). HAS_CHUNK is ignored.
+  2. The document tree and bundle details are built from that single response.
+     Any bundle referenced only at the CWID level (no inline node) is fetched
+     by vid as a fallback.
 
 Supplier enrichment (Type 4 flow, Step 4) is read from the CWID node itself,
 falling back to a best-effort tag probe.
@@ -140,20 +143,31 @@ def _bundle_summary(
     return summary
 
 
-def _fetch_bundles(
-    db: GraphDB, bundle_links: Dict[str, Optional[str]]
+def _resolve_bundles(
+    db: GraphDB,
+    bundle_types: Dict[str, Optional[str]],
+    bundle_nodes: Dict[str, Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
+    """
+    Build bundle summaries.
+
+    Bundle node detail (incl. clause fields) comes inline from the depth-2
+    IN_BUNDLE destination_node. For any bundle known only from a CWID-level
+    HAS_BUNDLE edge (no inline node), fetch it by vid as a fallback so clause
+    details are still populated.
+    """
     bundles: List[Dict[str, Any]] = []
-    for bundle_vid, bundle_type in bundle_links.items():
-        try:
-            nodes = db.get_nodes(vid=bundle_vid)
-        except GraphDBError as exc:
-            print(f"      WARN: bundle fetch failed for {bundle_vid}: {exc}")
-            bundles.append({"vid": bundle_vid, "bundle_type": bundle_type,
-                            "clauses": {}})
-            continue
-        if nodes:
-            bundles.append(_bundle_summary(nodes[0], bundle_type))
+    for bundle_vid in set(bundle_types) | set(bundle_nodes):
+        bundle_type = bundle_types.get(bundle_vid)
+        node = bundle_nodes.get(bundle_vid)
+        if node is None:
+            try:
+                fetched = db.get_nodes(vid=bundle_vid)
+                node = fetched[0] if fetched else None
+            except GraphDBError as exc:
+                print(f"      WARN: bundle fetch failed for {bundle_vid}: {exc}")
+        if node is not None:
+            bundles.append(_bundle_summary(node, bundle_type))
         else:
             bundles.append({"vid": bundle_vid, "bundle_type": bundle_type,
                             "clauses": {}})
@@ -180,79 +194,85 @@ def _doc_node(node: Dict[str, Any]) -> Dict[str, Any]:
 
 def _collect_documents_and_bundles(
     cwid: str, cwid_node: Dict[str, Any], db: GraphDB
-) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, str], Dict[str, Optional[str]]]:
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, str],
+           Dict[str, Optional[str]], Dict[str, Dict[str, Any]]]:
     """
-    Walk the graph from the CWID node.
+    Walk the depth-2 CWID response in a single pass.
+
+    The CWID node carries its edges; each document's `destination_node` carries
+    its own nested edges (CHILD_OF, IN_BUNDLE, HAS_CHUNK). HAS_CHUNK is ignored.
 
     Returns:
-        doc_nodes   : vid -> document node (raw)
-        child_parent: child_vid -> parent_vid   (from CHILD_OF edges)
-        bundles     : bundle_vid -> bundle_type  (from HAS_BUNDLE / IN_BUNDLE)
+        doc_nodes    : vid -> document node
+        child_parent : child_vid -> parent_vid     (from CHILD_OF edges)
+        bundle_types : bundle_vid -> bundle_type    (from HAS_BUNDLE / IN_BUNDLE)
+        bundle_nodes : bundle_vid -> bundle node    (from IN_BUNDLE destination_node)
     """
     doc_nodes: Dict[str, Dict[str, Any]] = {}
     child_parent: Dict[str, str] = {}
-    bundles: Dict[str, Optional[str]] = {}
-    queue: List[str] = []
+    bundle_types: Dict[str, Optional[str]] = {}
+    bundle_nodes: Dict[str, Dict[str, Any]] = {}
+    processed: set = set()
 
-    def register_doc(node: Optional[Dict[str, Any]], vid: Optional[str]) -> None:
-        if not vid or vid in doc_nodes:
+    def record_bundle_type(vid: Optional[str], btype: Optional[str]) -> None:
+        # A concrete bundle_type (from HAS_BUNDLE) wins over a None placeholder
+        # left by an IN_BUNDLE edge, regardless of which is seen first.
+        if not vid:
             return
-        tag = node.get("tag") if isinstance(node, dict) else None
-        if _is_chunk(node, tag):
+        if vid not in bundle_types or (bundle_types[vid] is None and btype):
+            bundle_types[vid] = btype
+
+    def handle_document(node: Optional[Dict[str, Any]]) -> None:
+        if not isinstance(node, dict):
             return
-        doc_nodes[vid] = node if isinstance(node, dict) else {"vid": vid}
-        queue.append(vid)
+        vid = node.get("vid")
+        if not vid or _is_chunk(node):
+            return
+        doc_nodes.setdefault(vid, node)
+        if vid in processed:
+            return
+        processed.add(vid)
 
-    # --- 1. CWID edges: outward HAS_DOCUMENT (docs), inward HAS_BUNDLE (bundle)
-    for edge in _edges(cwid_node):
-        name = _edge_name(edge)
-        if name == config.EDGE_HAS_DOCUMENT and \
-                _edge_direction(edge) == config.DIRECTION_OUTWARD:
-            register_doc(edge.get("destination_node"), edge.get("destination"))
-        elif name == config.EDGE_HAS_BUNDLE:
-            bundles.setdefault(
-                edge.get("destination"), _props(edge).get("bundle_type")
-            )
-
-    # --- 2. For each document, read CHILD_OF edges to other documents.
-    while queue:
-        vid = queue.pop(0)
-        try:
-            fetched = db.get_nodes(
-                vid=vid, get_edges=True, depth=config.DOC_FETCH_DEPTH
-            )
-        except GraphDBError as exc:
-            print(f"      WARN: document fetch failed for {vid}: {exc}")
-            continue
-        if not fetched:
-            continue
-        doc = fetched[0]
-        doc_nodes[vid] = doc  # replace with the full node
-
-        for edge in _edges(doc):
+        for edge in _edges(node):
             name = _edge_name(edge)
             neighbor_vid = edge.get("destination")
             neighbor_node = edge.get("destination_node")
 
             if name == config.EDGE_HAS_CHUNK or _is_chunk(neighbor_node):
-                continue  # never collect chunks
+                continue  # ignore chunks
 
             if name == config.EDGE_CHILD_OF:
-                # CHILD_OF points child -> parent.
                 if _edge_direction(edge) == config.DIRECTION_OUTWARD:
-                    child, parent = vid, neighbor_vid
-                else:  # inward: neighbor is the child of this doc
-                    child, parent = neighbor_vid, vid
+                    child, parent = vid, neighbor_vid     # this doc -> its parent
+                else:
+                    child, parent = neighbor_vid, vid     # neighbor is the child
                 if child and parent:
                     child_parent[child] = parent
-                register_doc(neighbor_node, neighbor_vid)
+                # The neighbor is another document (available inline at depth 2).
+                if isinstance(neighbor_node, dict) and \
+                        neighbor_node.get("tag") in config.DOCUMENT_TAGS:
+                    handle_document(neighbor_node)
 
             elif name == config.EDGE_IN_BUNDLE:
-                bundles.setdefault(
-                    neighbor_vid, _props(edge).get("bundle_type")
-                )
+                if neighbor_vid:
+                    if isinstance(neighbor_node, dict):
+                        bundle_nodes[neighbor_vid] = neighbor_node
+                    record_bundle_type(
+                        neighbor_vid, _props(edge).get("bundle_type")
+                    )
 
-    return doc_nodes, child_parent, bundles
+    # --- CWID edges: HAS_DOCUMENT (documents) + HAS_BUNDLE (bundle refs) ---
+    for edge in _edges(cwid_node):
+        name = _edge_name(edge)
+        if name == config.EDGE_HAS_DOCUMENT and \
+                _edge_direction(edge) == config.DIRECTION_OUTWARD:
+            handle_document(edge.get("destination_node"))
+        elif name == config.EDGE_HAS_BUNDLE:
+            record_bundle_type(
+                edge.get("destination"), _props(edge).get("bundle_type")
+            )
+
+    return doc_nodes, child_parent, bundle_types, bundle_nodes
 
 
 def _build_doc_tree(
@@ -295,16 +315,15 @@ def build_cwid_hierarchy(cwid: str, db: GraphDB) -> Optional[Dict[str, Any]]:
         print(f"    no CWID node for {cwid} -> no hierarchy")
         return None
 
-    doc_nodes, child_parent, bundle_links = _collect_documents_and_bundles(
-        cwid, cwid_node, db
-    )
+    doc_nodes, child_parent, bundle_types, bundle_nodes = \
+        _collect_documents_and_bundles(cwid, cwid_node, db)
 
     if not doc_nodes:
         print(f"    {cwid} has no documents -> no hierarchy")
         return None
 
     children = _build_doc_tree(doc_nodes, child_parent)
-    bundles = _fetch_bundles(db, bundle_links)
+    bundles = _resolve_bundles(db, bundle_types, bundle_nodes)
     enrichment = fetch_graph_properties(cwid, db, cwid_node)
 
     cprops = _props(cwid_node)

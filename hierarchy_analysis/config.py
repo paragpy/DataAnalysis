@@ -36,10 +36,12 @@ RETRY_BACKOFF_SECONDS = 2  # 2, 4, 8, 16 ...
 DEFAULT_LIMIT = 1000
 DEFAULT_DEPTH = 3
 
-# Depth used when fetching a CWID node (gives outward HAS_DOCUMENT documents and
-# inward HAS_BUNDLE bundle) and when fetching each document (gives CHILD_OF links
-# to other documents). Both are depth 1, as per the API behaviour.
-CWID_FETCH_DEPTH = 1
+# Depth used when fetching a CWID node. At depth 2 the single response carries
+# the CWID's edges (outward HAS_DOCUMENT documents, inward HAS_BUNDLE bundle
+# refs) AND each document's nested edges (CHILD_OF to other documents and
+# IN_BUNDLE to its bundle node, with clause fields inline). HAS_CHUNK is
+# ignored. The whole hierarchy is built from this one call.
+CWID_FETCH_DEPTH = 2
 DOC_FETCH_DEPTH = 1
 
 # ---------------------------------------------------------------------------

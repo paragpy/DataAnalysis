@@ -12,15 +12,16 @@ This implements the Type 4 flow (`type4_flow.md`) and the graph model in
 
 For each CWID:
 
-- **Document hierarchy** — built by traversing graph edges (all reads,
-  `depth=1`):
+- **Document hierarchy** — built from a **single `depth=2` read** per CWID:
   1. Fetch the CWID node by `vid` (vid == `contract_id`) with
-     `get_edges=true, depth=1`. Its edges give the **outward `HAS_DOCUMENT`**
-     documents that belong to the CWID and the **inward `HAS_BUNDLE`** bundle(s)
-     it belongs to.
-  2. Fetch each document by `vid` (`depth=1`) and read its **`CHILD_OF`** edges
-     to find which other documents it connects to, nesting child under parent.
-     **Chunks (`HAS_CHUNK` / `Chunk` nodes) are never collected.**
+     `get_edges=true, depth=2`. The one response carries the CWID's edges
+     (**outward `HAS_DOCUMENT`** documents, **inward `HAS_BUNDLE`** bundle refs)
+     and, inside each document's `destination_node`, that document's **nested
+     edges**: **`CHILD_OF`** to other documents and **`IN_BUNDLE`** to its
+     bundle node (clause fields inline).
+  2. The document tree and bundle details are built from that single response;
+     **chunks (`HAS_CHUNK` / `Chunk` nodes) are ignored.** A bundle referenced
+     only at the CWID level (no inline node) is fetched by `vid` as a fallback.
   Edge direction (`outward`/`inward`) is honoured: for `CHILD_OF`, an outward
   edge means the queried node is the child, an inward edge means it is the
   parent.
