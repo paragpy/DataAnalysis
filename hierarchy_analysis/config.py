@@ -44,6 +44,11 @@ DEFAULT_DEPTH = 3
 CWID_FETCH_DEPTH = 2
 DOC_FETCH_DEPTH = 1
 
+# Depth used when fetching a bundle by its id to read the inward IN_BUNDLE edges
+# (its member documents). Depth 0 returns the bundle node plus its direct edges
+# without expanding neighbours.
+BUNDLE_FETCH_DEPTH = 0
+
 # ---------------------------------------------------------------------------
 # Source of CWIDs
 # ---------------------------------------------------------------------------
@@ -171,3 +176,7 @@ NO_HIERARCHY_FILENAME = "cwids_without_hierarchy.txt"
 
 # Indentation unit used to render the tree label in the Excel "hierarchy" sheet.
 EXCEL_INDENT = "    "
+
+# Also render bundles (and their member documents) inside the Excel "hierarchy"
+# sheet, linked under their CWID, in addition to the dedicated "bundles" sheet.
+SHOW_BUNDLES_IN_HIERARCHY = True

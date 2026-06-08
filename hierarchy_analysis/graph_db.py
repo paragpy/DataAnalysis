@@ -150,6 +150,10 @@ class GraphDB:
             params["get_edges"] = "true"
             if edge_types:
                 params["edge_types"] = ",".join(edge_types)
-            params["depth"] = str(depth if depth is not None else config.DEFAULT_DEPTH)
+            d = depth if depth is not None else config.DEFAULT_DEPTH
+            # Omit depth when 0 (mirrors "depth unchecked"): the node and its
+            # direct inward/outward edges are still returned.
+            if d:
+                params["depth"] = str(d)
         params["limit"] = str(limit if limit is not None else config.DEFAULT_LIMIT)
         return self._get(params)

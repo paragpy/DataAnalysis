@@ -133,14 +133,30 @@ def fetch_graph_properties(
 # ---------------------------------------------------------------------------
 
 def _bundle_summary(
-    node: Dict[str, Any], bundle_type: Optional[str] = None
+    node: Dict[str, Any],
+    bundle_type: Optional[str] = None,
+    members: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     props = _props(node)
     summary: Dict[str, Any] = {"vid": node.get("vid"), "bundle_type": bundle_type}
     for field in config.BUNDLE_IDENTITY_FIELDS:
         summary[field] = props.get(field)
     summary["clauses"] = {f: props.get(f) for f in config.BUNDLE_CLAUSE_FIELDS}
+    summary["members"] = members or []
     return summary
+
+
+def _bundle_members(node: Dict[str, Any], bundle_vid: str) -> List[str]:
+    """Member document vids from a bundle's inward IN_BUNDLE edges."""
+    members: List[str] = []
+    for edge in _edges(node):
+        if _edge_name(edge) != config.EDGE_IN_BUNDLE:
+            continue
+        dst, src = edge.get("destination"), edge.get("source")
+        member = dst if dst and dst != bundle_vid else src
+        if member and member != bundle_vid and member not in members:
+            members.append(member)
+    return members
 
 
 def _resolve_bundles(
@@ -152,25 +168,36 @@ def _resolve_bundles(
     Build bundle summaries.
 
     Bundle node detail (incl. clause fields) comes inline from the depth-2
-    IN_BUNDLE destination_node. For any bundle known only from a CWID-level
-    HAS_BUNDLE edge (no inline node), fetch it by vid as a fallback so clause
-    details are still populated.
+    IN_BUNDLE destination_node. Each bundle is then fetched by its id at depth 0
+    to read its inward IN_BUNDLE edges (the member documents), which are used to
+    link the bundle back into the hierarchy. The depth-0 node also backfills the
+    clause fields when no inline node was captured.
     """
     bundles: List[Dict[str, Any]] = []
     for bundle_vid in set(bundle_types) | set(bundle_nodes):
         bundle_type = bundle_types.get(bundle_vid)
         node = bundle_nodes.get(bundle_vid)
-        if node is None:
-            try:
-                fetched = db.get_nodes(vid=bundle_vid)
-                node = fetched[0] if fetched else None
-            except GraphDBError as exc:
-                print(f"      WARN: bundle fetch failed for {bundle_vid}: {exc}")
+        members: List[str] = []
+
+        # Depth-0 fetch by id -> inward members (+ clauses fallback).
+        try:
+            fetched = db.get_nodes(
+                vid=bundle_vid, get_edges=True, depth=config.BUNDLE_FETCH_DEPTH
+            )
+        except GraphDBError as exc:
+            print(f"      WARN: bundle fetch failed for {bundle_vid}: {exc}")
+            fetched = []
+        if fetched:
+            members = _bundle_members(fetched[0], bundle_vid)
+            if node is None:
+                node = fetched[0]
+
         if node is not None:
-            bundles.append(_bundle_summary(node, bundle_type))
+            bundles.append(_bundle_summary(node, bundle_type, members))
         else:
             bundles.append({"vid": bundle_vid, "bundle_type": bundle_type,
-                            "clauses": {}})
+                            "clauses": {}, "members": members})
+        print(f"      bundle {bundle_vid}: {len(members)} member document(s)")
     return bundles
 
 

@@ -44,6 +44,39 @@ def _flatten_node(
         _flatten_node(child, cwid, level + 1, rows)
 
 
+def _append_bundle_rows(
+    bundle: Dict[str, Any], cwid: str, rows: List[Dict[str, Any]]
+) -> None:
+    """Render a bundle (level 1) and its member documents (level 2)."""
+    btype = bundle.get("bundle_type") or ""
+    bid = bundle.get("bundle_id") or bundle.get("vid") or ""
+    rows.append({
+        "cwid": cwid,
+        "level": 1,
+        "tree": f"{config.EXCEL_INDENT}Bundle [{btype}]: {bid}",
+        "node_type": config.BUNDLE_TAG,
+        "vid": bundle.get("vid"),
+        "contract_id": None,
+        "document_reference_number": None,
+        "unique_doc_id": None,
+        "document_title": None,
+        "supplier": None,
+    })
+    for member_vid in bundle.get("members", []):
+        rows.append({
+            "cwid": cwid,
+            "level": 2,
+            "tree": f"{config.EXCEL_INDENT * 2}member: {member_vid}",
+            "node_type": "BundleMember",
+            "vid": member_vid,
+            "contract_id": None,
+            "document_reference_number": None,
+            "unique_doc_id": member_vid,
+            "document_title": None,
+            "supplier": None,
+        })
+
+
 def _hierarchy_rows(document: Dict[str, Any]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for record in document.get("hierarchy", []):
@@ -63,6 +96,10 @@ def _hierarchy_rows(document: Dict[str, Any]) -> List[Dict[str, Any]]:
         })
         for child in record.get("children", []):
             _flatten_node(child, cwid, 1, rows)
+        # Link bundles back into the tree under their CWID.
+        if config.SHOW_BUNDLES_IN_HIERARCHY:
+            for bundle in record.get("bundles", []):
+                _append_bundle_rows(bundle, cwid, rows)
     return rows
 
 

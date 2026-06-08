@@ -30,6 +30,11 @@ For each CWID:
   `cwid`, fetches its full properties and extracts `supplier_address`,
   `supplier_reg_no`, and `services_mentioned` (normalised to a list). Failures
   log a WARN and continue.
+- **Bundle linkage** — after the depth-2 pass, each bundle is fetched **by its
+  id at `depth=0`** (`get_edges=true`). That returns the bundle's inward
+  `IN_BUNDLE` edges (its **member documents**), which are stored on the bundle
+  and rendered back into the Excel **`hierarchy`** sheet: the bundle appears at
+  level 1 under its CWID and its member documents at level 2.
 - **Bundle details** (`graph_schema_v1.md` §2.2) — `bundle_id`,
   `swoosh_job_id`, `sb_job_id` plus the nullable clause fields
   (`governing_law`, `assignment_novation`, `license_grant`, `right_to_use`,
@@ -52,7 +57,8 @@ For each CWID:
 
 - `per_cwid_json/<CWID>.json` — one hierarchy record per CWID.
 - `hierarchy_output.xlsx` — three readable sheets:
-  - **hierarchy** — one row per node with an indented `tree` label.
+  - **hierarchy** — one row per node with an indented `tree` label; bundles
+    (level 1) and their member documents (level 2) are linked under each CWID.
   - **suppliers** — consolidated supplier enrichment per CWID.
   - **bundles** — bundle identity + clause fields per bundle.
 - `cwids_without_hierarchy.txt` — CWIDs that had **no documents**. These are
