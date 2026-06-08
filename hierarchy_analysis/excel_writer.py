@@ -62,16 +62,24 @@ def _append_bundle_rows(
         "document_title": None,
         "supplier": None,
     })
-    for member_vid in bundle.get("members", []):
+    for member in bundle.get("members", []):
+        # Members may be enriched dicts {vid, node_type, unique_doc_id} or, for
+        # backward compatibility, a plain vid string.
+        if isinstance(member, dict):
+            mvid = member.get("vid")
+            mtype = member.get("node_type") or "BundleMember"
+            mdoc = member.get("unique_doc_id") or mvid
+        else:
+            mvid, mtype, mdoc = member, "BundleMember", member
         rows.append({
             "cwid": cwid,
             "level": 2,
-            "tree": f"{config.EXCEL_INDENT * 2}member: {member_vid}",
-            "node_type": "BundleMember",
-            "vid": member_vid,
+            "tree": f"{config.EXCEL_INDENT * 2}{mtype}: {mdoc}",
+            "node_type": mtype,
+            "vid": mvid,
             "contract_id": None,
             "document_reference_number": None,
-            "unique_doc_id": member_vid,
+            "unique_doc_id": mdoc,
             "document_title": None,
             "supplier": None,
         })

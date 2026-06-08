@@ -34,7 +34,9 @@ For each CWID:
   id at `depth=0`** (`get_edges=true`). That returns the bundle's inward
   `IN_BUNDLE` edges (its **member documents**), which are stored on the bundle
   and rendered back into the Excel **`hierarchy`** sheet: the bundle appears at
-  level 1 under its CWID and its member documents at level 2.
+  level 1 under its CWID and its member documents at level 2. Each member is
+  resolved against the depth-2 documents so its **real node type**
+  (`MasterAgreement` / `SubAgreement` / …) is shown rather than a generic label.
 - **Bundle details** (`graph_schema_v1.md` §2.2) — `bundle_id`,
   `swoosh_job_id`, `sb_job_id` plus the nullable clause fields
   (`governing_law`, `assignment_novation`, `license_grant`, `right_to_use`,

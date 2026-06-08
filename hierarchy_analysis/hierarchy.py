@@ -163,6 +163,7 @@ def _resolve_bundles(
     db: GraphDB,
     bundle_types: Dict[str, Optional[str]],
     bundle_nodes: Dict[str, Dict[str, Any]],
+    doc_nodes: Dict[str, Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     """
     Build bundle summaries.
@@ -177,7 +178,7 @@ def _resolve_bundles(
     for bundle_vid in set(bundle_types) | set(bundle_nodes):
         bundle_type = bundle_types.get(bundle_vid)
         node = bundle_nodes.get(bundle_vid)
-        members: List[str] = []
+        members: List[Dict[str, Any]] = []
 
         # Depth-0 fetch by id -> inward members (+ clauses fallback).
         try:
@@ -188,7 +189,16 @@ def _resolve_bundles(
             print(f"      WARN: bundle fetch failed for {bundle_vid}: {exc}")
             fetched = []
         if fetched:
-            members = _bundle_members(fetched[0], bundle_vid)
+            # Resolve each member vid to its real document type (tag) using the
+            # documents already collected from the depth-2 CWID fetch.
+            for member_vid in _bundle_members(fetched[0], bundle_vid):
+                member_doc = doc_nodes.get(member_vid)
+                members.append({
+                    "vid": member_vid,
+                    "node_type": member_doc.get("tag") if member_doc else None,
+                    "unique_doc_id": _props(member_doc).get("unique_doc_id")
+                    if member_doc else None,
+                })
             if node is None:
                 node = fetched[0]
 
@@ -350,7 +360,7 @@ def build_cwid_hierarchy(cwid: str, db: GraphDB) -> Optional[Dict[str, Any]]:
         return None
 
     children = _build_doc_tree(doc_nodes, child_parent)
-    bundles = _resolve_bundles(db, bundle_types, bundle_nodes)
+    bundles = _resolve_bundles(db, bundle_types, bundle_nodes, doc_nodes)
     enrichment = fetch_graph_properties(cwid, db, cwid_node)
 
     cprops = _props(cwid_node)
