@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+hierarchy_output.json
+hierarchy_output.xlsx
+per_cwid_json/
+*.xlsx
