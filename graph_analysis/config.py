@@ -43,8 +43,10 @@ HEADERS = {
     # "Authorization": "Bearer <token>",
 }
 
-# Verify TLS certificates. Set to False for self-signed dev/staging certs.
-VERIFY_SSL = True
+# Verify TLS certificates. The dev/staging host uses a self-signed
+# certificate, so this is False by default. Set to True against an environment
+# with a trusted/CA-signed certificate.
+VERIFY_SSL = False
 
 # Per-request timeout in seconds.
 REQUEST_TIMEOUT = 60

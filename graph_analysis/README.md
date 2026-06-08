@@ -43,7 +43,8 @@ command line. Review/adjust before running:
 
 - `BASE_URL`, `NODES_ENDPOINT`, `SPACE_NAME`
 - `HEADERS` (add an `Authorization` token / cookie if required)
-- `VERIFY_SSL` (set `False` for self-signed staging certs)
+- `VERIFY_SSL` (defaults to `False` because the staging host uses a self-signed
+  cert; set `True` against a CA-trusted environment)
 - `EXTRA_QUERY_PARAMS` (e.g. `limit`, `depth`, `get_edges`)
 - `SWOOSH_JOB_ID_COLUMN` (defaults to `swoosh_job_id`)
 

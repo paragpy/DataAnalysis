@@ -16,6 +16,17 @@ import requests
 
 import config
 
+# The dev/staging host uses a self-signed certificate. When SSL verification is
+# disabled in config, urllib3 emits a noisy InsecureRequestWarning on every
+# request — silence it so the progress output stays readable.
+if not config.VERIFY_SSL:
+    try:
+        from urllib3.exceptions import InsecureRequestWarning
+
+        requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+    except Exception:
+        pass
+
 
 class GraphAPIError(RuntimeError):
     """Raised when the graph API cannot be reached or returns an error."""
