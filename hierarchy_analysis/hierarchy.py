@@ -1,18 +1,26 @@
 """
-Hierarchy construction for a single CWID.
+Hierarchy construction for a single CWID, using the real graph edge model.
 
-Combines three things, per the Type 4 flow and graph_schema_v1.md:
+Traversal (all reads, depth 1 per the API behaviour):
 
-  * the document tree  (HAS_DOCUMENT + CHILD_OF edges / property match rules)
-  * supplier enrichment (Step 4 — best-effort READ)
-  * bundle details      (graph_schema_v1.md §2.2)
+  1. Fetch the CWID node by vid (vid == contract_id) with get_edges=true,
+     depth=1. Its edges give:
+        * outward HAS_DOCUMENT -> the documents that belong to the CWID
+        * inward  HAS_BUNDLE   -> the bundle(s) the CWID belongs to
+  2. For each document, fetch it by vid (depth 1) and read its CHILD_OF edges to
+     discover which OTHER documents it connects to (chunks are excluded).
+  3. Fetch each bundle by vid for its identity + clause fields.
 
-The public entry point is `build_cwid_hierarchy(cwid, db)`.
+Supplier enrichment (Type 4 flow, Step 4) is read from the CWID node itself,
+falling back to a best-effort tag probe.
+
+`build_cwid_hierarchy(cwid, db)` returns the record dict, or None when the CWID
+has no hierarchy (no documents).
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import config
 from graph_db import GraphDB, GraphDBError
@@ -26,16 +34,11 @@ def _props(node: Dict[str, Any]) -> Dict[str, Any]:
     return node.get("properties", {}) if isinstance(node, dict) else {}
 
 
-def _prop(node: Dict[str, Any], key: str) -> Any:
-    return _props(node).get(key)
-
-
 def _is_empty(value: Any) -> bool:
     return value is None or (isinstance(value, str) and value.strip() == "")
 
 
 def _normalise_list(value: Any) -> List[str]:
-    """Normalise a comma-separated string or list into a list of strings."""
     if value is None:
         return []
     if isinstance(value, list):
@@ -50,43 +53,61 @@ def _edges(node: Dict[str, Any]) -> List[Dict[str, Any]]:
     return edges if isinstance(edges, list) else []
 
 
-def _edge_type(edge: Dict[str, Any]) -> Optional[str]:
-    for key in ("edge_type", "type", "name", "label"):
-        if edge.get(key):
-            return edge[key]
-    return None
+def _edge_name(edge: Dict[str, Any]) -> Optional[str]:
+    # The API uses "name" (e.g. HAS_DOCUMENT); fall back to relation_type.
+    return edge.get("name") or _props(edge).get("relation_type")
 
 
-def _edge_src(edge: Dict[str, Any]) -> Optional[str]:
-    for key in ("src", "source", "from", "start", "src_vid", "src_id"):
-        if edge.get(key):
-            return edge[key]
-    return None
+def _edge_direction(edge: Dict[str, Any]) -> Optional[str]:
+    return edge.get("direction")
 
 
-def _edge_dst(edge: Dict[str, Any]) -> Optional[str]:
-    for key in ("dst", "destination", "to", "end", "dst_vid", "dst_id"):
-        if edge.get(key):
-            return edge[key]
-    return None
+def _is_chunk(node: Optional[Dict[str, Any]], tag: Optional[str] = None) -> bool:
+    tag = tag or (node.get("tag") if isinstance(node, dict) else None)
+    return tag in config.EXCLUDE_TAGS
 
 
 # ---------------------------------------------------------------------------
-# Step 4 — Graph enrichment (best-effort READ)
+# Step 4 — supplier enrichment (best-effort READ)
 # ---------------------------------------------------------------------------
 
-def fetch_graph_properties(cwid: str, db: GraphDB) -> Dict[str, Any]:
-    """
-    Best-effort lookup of the three enrichment fields for a CWID.
+def _extract_enrichment_from_props(props: Dict[str, Any]) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    for out_field in config.ENRICHMENT_FIELDS:
+        src = config.ENRICHMENT_SOURCE_MAP.get(out_field, out_field)
+        value = props.get(src)
+        if out_field in config.ENRICHMENT_LIST_FIELDS:
+            result[out_field] = _normalise_list(value)
+        else:
+            result[out_field] = None if _is_empty(value) else value
+    return result
 
-    Probes ENRICHMENT_PROBE_TAGS in order, finds the node by
-    ENRICHMENT_MATCH_PROPERTY, fetches its full properties and extracts
-    supplier_address / supplier_reg_no / services_mentioned. Any failure logs a
-    WARN and continues (enrichment is best-effort).
+
+def _enrichment_complete(enr: Dict[str, Any]) -> bool:
+    for field in config.ENRICHMENT_FIELDS:
+        value = enr.get(field)
+        if field in config.ENRICHMENT_LIST_FIELDS:
+            if value:
+                return True
+        elif not _is_empty(value):
+            return True
+    return False
+
+
+def fetch_graph_properties(
+    cwid: str, db: GraphDB, cwid_node: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """
-    default: Dict[str, Any] = {f: None for f in config.ENRICHMENT_FIELDS}
-    for field in config.ENRICHMENT_LIST_FIELDS:
-        default[field] = []
+    Enrichment for a CWID. Reads supplier_address / supplier_reg_no /
+    services_mentioned from the already-fetched CWID node, then falls back to a
+    best-effort tag probe for anything still missing.
+    """
+    enr = _extract_enrichment_from_props(_props(cwid_node)) if cwid_node else {
+        f: ([] if f in config.ENRICHMENT_LIST_FIELDS else None)
+        for f in config.ENRICHMENT_FIELDS
+    }
+    if _enrichment_complete(enr):
+        return enr
 
     for tag in config.ENRICHMENT_PROBE_TAGS:
         try:
@@ -96,89 +117,54 @@ def fetch_graph_properties(cwid: str, db: GraphDB) -> Dict[str, Any]:
         except GraphDBError as exc:
             print(f"      WARN: enrichment probe {tag} failed for {cwid}: {exc}")
             continue
+        if node:
+            print(f"      enrichment fallback hit for {cwid} via tag {tag!r}")
+            return _extract_enrichment_from_props(_props(node))
 
-        if not node:
-            continue
-
-        # Fetch the full node properties via its vid (Step 4).
-        vid = node.get("vid")
-        props = _props(node)
-        if vid:
-            try:
-                full = db.get_nodes(vid=vid)
-                if full:
-                    props = _props(full[0]) or props
-            except GraphDBError as exc:
-                print(f"      WARN: get_nodes({vid}) failed for {cwid}: {exc}")
-
-        result: Dict[str, Any] = {}
-        for field in config.ENRICHMENT_FIELDS:
-            value = props.get(field)
-            if field in config.ENRICHMENT_LIST_FIELDS:
-                result[field] = _normalise_list(value)
-            else:
-                result[field] = None if _is_empty(value) else value
-        result["_supplier_name"] = props.get(config.SUPPLIER_NAME_PROPERTY)
-        print(f"      enrichment hit for {cwid} via tag {tag!r}")
-        return result
-
-    print(f"      WARN: no enrichment node found for {cwid} (best-effort)")
-    return default
+    print(f"      WARN: enrichment incomplete for {cwid} (best-effort)")
+    return enr
 
 
 # ---------------------------------------------------------------------------
-# Bundle details (graph_schema_v1.md §2.2)
+# bundles
 # ---------------------------------------------------------------------------
 
-def _bundle_summary(node: Dict[str, Any]) -> Dict[str, Any]:
-    """Reduce a Bundle node to its identity + clause fields."""
+def _bundle_summary(
+    node: Dict[str, Any], bundle_type: Optional[str] = None
+) -> Dict[str, Any]:
     props = _props(node)
-    summary: Dict[str, Any] = {"vid": node.get("vid")}
+    summary: Dict[str, Any] = {"vid": node.get("vid"), "bundle_type": bundle_type}
     for field in config.BUNDLE_IDENTITY_FIELDS:
         summary[field] = props.get(field)
-    clauses = {f: props.get(f) for f in config.BUNDLE_CLAUSE_FIELDS}
-    summary["clauses"] = clauses
+    summary["clauses"] = {f: props.get(f) for f in config.BUNDLE_CLAUSE_FIELDS}
     return summary
 
 
-def _collect_bundles(
-    db: GraphDB,
-    subgraph: List[Dict[str, Any]],
-    documents: List[Dict[str, Any]],
+def _fetch_bundles(
+    db: GraphDB, bundle_links: Dict[str, Optional[str]]
 ) -> List[Dict[str, Any]]:
-    """Gather bundle nodes for a CWID from the subgraph, with a fallback query."""
-    bundles: Dict[str, Dict[str, Any]] = {}
-
-    # Primary: any Bundle-tag node already present in the traversed subgraph.
-    for node in subgraph:
-        if node.get("tag") == config.BUNDLE_TAG:
-            bundles[node.get("vid")] = node
-
-    # Fallback: query bundles by the documents' swoosh_job_id.
-    if not bundles:
-        seen_jobs = set()
-        for doc in documents:
-            job = _prop(doc, config.BUNDLE_LINK_PROPERTY)
-            if _is_empty(job) or job in seen_jobs:
-                continue
-            seen_jobs.add(job)
-            try:
-                for node in db.find_nodes_by_property(
-                    config.BUNDLE_LINK_PROPERTY, job, tag=config.BUNDLE_TAG
-                ):
-                    bundles[node.get("vid")] = node
-            except GraphDBError as exc:
-                print(f"      WARN: bundle lookup failed for job {job}: {exc}")
-
-    return [_bundle_summary(n) for n in bundles.values()]
+    bundles: List[Dict[str, Any]] = []
+    for bundle_vid, bundle_type in bundle_links.items():
+        try:
+            nodes = db.get_nodes(vid=bundle_vid)
+        except GraphDBError as exc:
+            print(f"      WARN: bundle fetch failed for {bundle_vid}: {exc}")
+            bundles.append({"vid": bundle_vid, "bundle_type": bundle_type,
+                            "clauses": {}})
+            continue
+        if nodes:
+            bundles.append(_bundle_summary(nodes[0], bundle_type))
+        else:
+            bundles.append({"vid": bundle_vid, "bundle_type": bundle_type,
+                            "clauses": {}})
+    return bundles
 
 
 # ---------------------------------------------------------------------------
-# Document tree (HAS_DOCUMENT + CHILD_OF)
+# documents
 # ---------------------------------------------------------------------------
 
 def _doc_node(node: Dict[str, Any]) -> Dict[str, Any]:
-    """Shape a document node for the output hierarchy."""
     props = _props(node)
     return {
         "tag": node.get("tag"),
@@ -192,67 +178,94 @@ def _doc_node(node: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _find_parent_vid_by_edges(
-    child: Dict[str, Any], by_vid: Dict[str, Dict[str, Any]]
-) -> Optional[str]:
-    """Use CHILD_OF edges (child -> parent) on the child node, if present."""
-    child_vid = child.get("vid")
-    for edge in _edges(child):
-        if _edge_type(edge) != config.EDGE_CHILD_OF:
-            continue
-        src, dst = _edge_src(edge), _edge_dst(edge)
-        # CHILD_OF points child -> parent.
-        if src == child_vid and dst in by_vid:
-            return dst
-        if dst == child_vid and src in by_vid:
-            return src
-    return None
-
-
-def _find_parent_vid_by_props(
-    child: Dict[str, Any],
-    documents: List[Dict[str, Any]],
-    cwid_vid: Optional[str],
-) -> Optional[str]:
+def _collect_documents_and_bundles(
+    cwid: str, cwid_node: Dict[str, Any], db: GraphDB
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, str], Dict[str, Optional[str]]]:
     """
-    Apply the CHILD_OF property match rules in order.
+    Walk the graph from the CWID node.
 
-    Returns the parent document's vid, or None when the child is top-level
-    (its parent is the CWID itself / no document parent found).
+    Returns:
+        doc_nodes   : vid -> document node (raw)
+        child_parent: child_vid -> parent_vid   (from CHILD_OF edges)
+        bundles     : bundle_vid -> bundle_type  (from HAS_BUNDLE / IN_BUNDLE)
     """
-    child_vid = child.get("vid")
-    for child_prop, parent_prop in config.CHILD_OF_RULES:
-        value = _prop(child, child_prop)
-        if _is_empty(value):
+    doc_nodes: Dict[str, Dict[str, Any]] = {}
+    child_parent: Dict[str, str] = {}
+    bundles: Dict[str, Optional[str]] = {}
+    queue: List[str] = []
+
+    def register_doc(node: Optional[Dict[str, Any]], vid: Optional[str]) -> None:
+        if not vid or vid in doc_nodes:
+            return
+        tag = node.get("tag") if isinstance(node, dict) else None
+        if _is_chunk(node, tag):
+            return
+        doc_nodes[vid] = node if isinstance(node, dict) else {"vid": vid}
+        queue.append(vid)
+
+    # --- 1. CWID edges: outward HAS_DOCUMENT (docs), inward HAS_BUNDLE (bundle)
+    for edge in _edges(cwid_node):
+        name = _edge_name(edge)
+        if name == config.EDGE_HAS_DOCUMENT and \
+                _edge_direction(edge) == config.DIRECTION_OUTWARD:
+            register_doc(edge.get("destination_node"), edge.get("destination"))
+        elif name == config.EDGE_HAS_BUNDLE:
+            bundles.setdefault(
+                edge.get("destination"), _props(edge).get("bundle_type")
+            )
+
+    # --- 2. For each document, read CHILD_OF edges to other documents.
+    while queue:
+        vid = queue.pop(0)
+        try:
+            fetched = db.get_nodes(
+                vid=vid, get_edges=True, depth=config.DOC_FETCH_DEPTH
+            )
+        except GraphDBError as exc:
+            print(f"      WARN: document fetch failed for {vid}: {exc}")
             continue
-        matches = [
-            d for d in documents
-            if d.get("vid") != child_vid and _prop(d, parent_prop) == value
-        ]
-        # Accept only an unambiguous single document parent.
-        if len(matches) == 1:
-            return matches[0].get("vid")
-    return None  # top-level -> attach under the CWID root
+        if not fetched:
+            continue
+        doc = fetched[0]
+        doc_nodes[vid] = doc  # replace with the full node
+
+        for edge in _edges(doc):
+            name = _edge_name(edge)
+            neighbor_vid = edge.get("destination")
+            neighbor_node = edge.get("destination_node")
+
+            if name == config.EDGE_HAS_CHUNK or _is_chunk(neighbor_node):
+                continue  # never collect chunks
+
+            if name == config.EDGE_CHILD_OF:
+                # CHILD_OF points child -> parent.
+                if _edge_direction(edge) == config.DIRECTION_OUTWARD:
+                    child, parent = vid, neighbor_vid
+                else:  # inward: neighbor is the child of this doc
+                    child, parent = neighbor_vid, vid
+                if child and parent:
+                    child_parent[child] = parent
+                register_doc(neighbor_node, neighbor_vid)
+
+            elif name == config.EDGE_IN_BUNDLE:
+                bundles.setdefault(
+                    neighbor_vid, _props(edge).get("bundle_type")
+                )
+
+    return doc_nodes, child_parent, bundles
 
 
 def _build_doc_tree(
-    documents: List[Dict[str, Any]], cwid_vid: Optional[str]
+    doc_nodes: Dict[str, Dict[str, Any]], child_parent: Dict[str, str]
 ) -> List[Dict[str, Any]]:
-    """Nest documents into a tree using edges first, then property rules."""
-    by_vid = {d.get("vid"): d for d in documents}
-    shaped = {d.get("vid"): _doc_node(d) for d in documents}
+    shaped = {vid: _doc_node(node) for vid, node in doc_nodes.items()}
     roots: List[Dict[str, Any]] = []
-
-    for doc in documents:
-        vid = doc.get("vid")
-        parent_vid = _find_parent_vid_by_edges(doc, by_vid)
-        if parent_vid is None or parent_vid == cwid_vid:
-            parent_vid = _find_parent_vid_by_props(doc, documents, cwid_vid)
-        if parent_vid and parent_vid in shaped and parent_vid != vid:
-            shaped[parent_vid]["children"].append(shaped[vid])
+    for vid in doc_nodes:
+        parent = child_parent.get(vid)
+        if parent and parent in shaped and parent != vid:
+            shaped[parent]["children"].append(shaped[vid])
         else:
-            roots.append(shaped[vid])
-
+            roots.append(shaped[vid])  # parent is the CWID / unknown -> root
     return roots
 
 
@@ -260,58 +273,54 @@ def _build_doc_tree(
 # public entry point
 # ---------------------------------------------------------------------------
 
-def build_cwid_hierarchy(cwid: str, db: GraphDB) -> Dict[str, Any]:
-    """Build the full hierarchy record for one CWID."""
+def build_cwid_hierarchy(cwid: str, db: GraphDB) -> Optional[Dict[str, Any]]:
+    """
+    Build the hierarchy record for one CWID, or return None if it has no
+    hierarchy (no documents).
+    """
     print(f"  Building hierarchy for CWID {cwid} ...")
 
-    # Pull the CWID subgraph: the CWID node + all nodes sharing its contract_id,
-    # with edges traversed so bundles/children come along.
-    subgraph = db.find_nodes_by_property(
-        config.CWID_MATCH_PROPERTY,
-        cwid,
-        get_edges=True,
-        depth=config.DEFAULT_DEPTH,
+    try:
+        fetched = db.get_nodes(
+            vid=cwid, get_edges=True, depth=config.CWID_FETCH_DEPTH
+        )
+    except GraphDBError as exc:
+        print(f"    WARN: CWID fetch failed for {cwid}: {exc}")
+        return None
+
+    cwid_node = next((n for n in fetched if n.get("tag") == config.CWID_TAG), None)
+    if cwid_node is None and fetched:
+        cwid_node = fetched[0]
+    if cwid_node is None:
+        print(f"    no CWID node for {cwid} -> no hierarchy")
+        return None
+
+    doc_nodes, child_parent, bundle_links = _collect_documents_and_bundles(
+        cwid, cwid_node, db
     )
 
-    # Fallback to the ariba id if nothing matched on contract_id.
-    if not subgraph and config.CWID_MATCH_FALLBACK:
-        print(f"    no match on {config.CWID_MATCH_PROPERTY}; "
-              f"trying {config.CWID_MATCH_FALLBACK}")
-        subgraph = db.find_nodes_by_property(
-            config.CWID_MATCH_FALLBACK, cwid, get_edges=True,
-            depth=config.DEFAULT_DEPTH,
-        )
+    if not doc_nodes:
+        print(f"    {cwid} has no documents -> no hierarchy")
+        return None
 
-    cwid_node = next((n for n in subgraph if n.get("tag") == config.CWID_TAG), None)
-    documents = [n for n in subgraph if n.get("tag") in config.DOCUMENT_TAGS]
-    cwid_vid = cwid_node.get("vid") if cwid_node else None
+    children = _build_doc_tree(doc_nodes, child_parent)
+    bundles = _fetch_bundles(db, bundle_links)
+    enrichment = fetch_graph_properties(cwid, db, cwid_node)
 
-    print(f"    found {len(documents)} document node(s); "
-          f"CWID node {'present' if cwid_node else 'missing'}")
-
-    # Document tree.
-    children = _build_doc_tree(documents, cwid_vid)
-
-    # Bundle details.
-    bundles = _collect_bundles(db, subgraph, documents)
-    print(f"    found {len(bundles)} bundle(s)")
-
-    # Step 4 enrichment.
-    enrichment = fetch_graph_properties(cwid, db)
-    supplier_name = enrichment.pop("_supplier_name", None)
-    if _is_empty(supplier_name) and cwid_node:
-        supplier_name = _prop(cwid_node, config.SUPPLIER_NAME_PROPERTY)
-
+    cprops = _props(cwid_node)
+    supplier = cprops.get(config.SUPPLIER_NAME_PROPERTY)
     unique_doc_ids = [
-        _prop(d, "unique_doc_id") for d in documents
-        if not _is_empty(_prop(d, "unique_doc_id"))
+        _props(n).get("unique_doc_id") for n in doc_nodes.values()
+        if not _is_empty(_props(n).get("unique_doc_id"))
     ]
+
+    print(f"    {len(doc_nodes)} document(s), {len(bundles)} bundle(s)")
 
     return {
         "cwid": cwid,
-        "vid": cwid_vid,
-        "contract_id": _prop(cwid_node, "contract_id") if cwid_node else cwid,
-        "supplier": supplier_name,
+        "vid": cwid_node.get("vid", cwid),
+        "contract_id": cprops.get("contract_id", cwid),
+        "supplier": supplier,
         "enrichment": enrichment,
         "unique_doc_ids": unique_doc_ids,
         "bundles": bundles,

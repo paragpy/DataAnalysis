@@ -36,6 +36,12 @@ RETRY_BACKOFF_SECONDS = 2  # 2, 4, 8, 16 ...
 DEFAULT_LIMIT = 1000
 DEFAULT_DEPTH = 3
 
+# Depth used when fetching a CWID node (gives outward HAS_DOCUMENT documents and
+# inward HAS_BUNDLE bundle) and when fetching each document (gives CHILD_OF links
+# to other documents). Both are depth 1, as per the API behaviour.
+CWID_FETCH_DEPTH = 1
+DOC_FETCH_DEPTH = 1
+
 # ---------------------------------------------------------------------------
 # Source of CWIDs
 # ---------------------------------------------------------------------------
@@ -69,12 +75,19 @@ DOCUMENT_TAGS = [
 BUNDLE_TAG = "Bundle"
 CHUNK_TAG = "Chunk"
 
-# Edge type names.
+# Tags that are never collected into the hierarchy (chunks are excluded).
+EXCLUDE_TAGS = ["Chunk"]
+
+# Edge type names (the API exposes these as the edge "name" field).
 EDGE_HAS_DOCUMENT = "HAS_DOCUMENT"
 EDGE_CHILD_OF = "CHILD_OF"
 EDGE_IN_BUNDLE = "IN_BUNDLE"
 EDGE_HAS_BUNDLE = "HAS_BUNDLE"
 EDGE_HAS_CHUNK = "HAS_CHUNK"
+
+# Edge direction values relative to the queried node.
+DIRECTION_OUTWARD = "outward"
+DIRECTION_INWARD = "inward"
 
 # Property used to match all nodes belonging to one CWID. Per the HAS_DOCUMENT
 # match rule, a CWID and all its documents share the same contract_id; the
@@ -103,6 +116,15 @@ ENRICHMENT_MATCH_PROPERTY = "cwid"
 
 # The three enrichment fields extracted (Step 4).
 ENRICHMENT_FIELDS = ["supplier_address", "supplier_reg_no", "services_mentioned"]
+
+# Maps each output enrichment field to the node property it is read from.
+# (The CWID/document node stores the registration number as
+# `supplier_registration_number`.)
+ENRICHMENT_SOURCE_MAP = {
+    "supplier_address": "supplier_address",
+    "supplier_reg_no": "supplier_registration_number",
+    "services_mentioned": "services_mentioned",
+}
 
 # Fields that are comma-separated strings or lists and should be normalised to
 # a list of strings.
@@ -140,6 +162,10 @@ EXCEL_OUTPUT_FILENAME = "hierarchy_output.xlsx"
 
 # Also write one JSON file per CWID into this subfolder (set to None to skip).
 PER_CWID_JSON_DIR = "per_cwid_json"
+
+# Plain-text list of CWIDs that had no hierarchy (no documents). These CWIDs are
+# excluded from both the JSON and the Excel outputs.
+NO_HIERARCHY_FILENAME = "cwids_without_hierarchy.txt"
 
 # Indentation unit used to render the tree label in the Excel "hierarchy" sheet.
 EXCEL_INDENT = "    "

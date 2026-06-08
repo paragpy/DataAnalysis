@@ -12,12 +12,18 @@ This implements the Type 4 flow (`type4_flow.md`) and the graph model in
 
 For each CWID:
 
-- **Document hierarchy** — `CWID --HAS_DOCUMENT--> {MA|SA|MAV|SAV|SD}`, nested
-  by `CHILD_OF` (child → parent). Nesting is derived from the documented match
-  rules (tried in order): `parent_contract_id → contract_id`,
-  `parent_document_reference_number → document_reference_number`,
-  `ariba_parent_contract_id → ariba_contract_id`. `CHILD_OF` edges are used
-  first when the API returns them, with the property rules as fallback.
+- **Document hierarchy** — built by traversing graph edges (all reads,
+  `depth=1`):
+  1. Fetch the CWID node by `vid` (vid == `contract_id`) with
+     `get_edges=true, depth=1`. Its edges give the **outward `HAS_DOCUMENT`**
+     documents that belong to the CWID and the **inward `HAS_BUNDLE`** bundle(s)
+     it belongs to.
+  2. Fetch each document by `vid` (`depth=1`) and read its **`CHILD_OF`** edges
+     to find which other documents it connects to, nesting child under parent.
+     **Chunks (`HAS_CHUNK` / `Chunk` nodes) are never collected.**
+  Edge direction (`outward`/`inward`) is honoured: for `CHILD_OF`, an outward
+  edge means the queried node is the child, an inward edge means it is the
+  parent.
 - **Supplier enrichment** (Step 4, best-effort) — probes
   `ContractWorkspace → MasterAgreement → SubAgreement`, finds the node by
   `cwid`, fetches its full properties and extracts `supplier_address`,
@@ -48,6 +54,9 @@ For each CWID:
   - **hierarchy** — one row per node with an indented `tree` label.
   - **suppliers** — consolidated supplier enrichment per CWID.
   - **bundles** — bundle identity + clause fields per bundle.
+- `cwids_without_hierarchy.txt` — CWIDs that had **no documents**. These are
+  **excluded from both the JSON and the Excel** and listed here only, one per
+  line.
 
 ## Configuration
 

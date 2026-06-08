@@ -2,5 +2,6 @@ __pycache__/
 *.pyc
 hierarchy_output.json
 hierarchy_output.xlsx
+cwids_without_hierarchy.txt
 per_cwid_json/
 *.xlsx

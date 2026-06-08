@@ -22,7 +22,7 @@ import json
 import os
 import sys
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import config
 from excel_writer import write_excel
@@ -85,15 +85,26 @@ def load_unique_cwids() -> List[str]:
 # Step 6 — build output document
 # ---------------------------------------------------------------------------
 
-def build_output_document(cwids: List[str], db: GraphDB) -> Dict[str, Any]:
-    """Assemble {header, hierarchy[], suppliers[]} for all CWIDs."""
+def build_output_document(
+    cwids: List[str], db: GraphDB
+) -> Tuple[Dict[str, Any], List[str]]:
+    """
+    Assemble {header, hierarchy[], suppliers[]} for all CWIDs.
+
+    CWIDs with no hierarchy (no documents) are excluded from the document and
+    returned separately as a list.
+    """
     hierarchy: List[Dict[str, Any]] = []
     suppliers: List[Dict[str, Any]] = []
     seen_suppliers: set = set()
+    no_hierarchy: List[str] = []
 
     for idx, cwid in enumerate(cwids, start=1):
         print(f"[{idx}/{len(cwids)}] CWID {cwid}")
         record = build_cwid_hierarchy(cwid, db)
+        if record is None:
+            no_hierarchy.append(cwid)
+            continue
         hierarchy.append(record)
 
         # Consolidate suppliers (Step 5 spirit): one entry per supplier name.
@@ -109,24 +120,34 @@ def build_output_document(cwids: List[str], db: GraphDB) -> Dict[str, Any]:
                 "supplier_reg_no": enr.get("supplier_reg_no"),
             })
 
-    return {
+    document = {
         "header": {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "space_name": config.SPACE_NAME,
             "cwid_count": len(cwids),
+            "with_hierarchy": len(hierarchy),
+            "without_hierarchy": len(no_hierarchy),
         },
         "hierarchy": hierarchy,
         "suppliers": suppliers,
     }
+    return document, no_hierarchy
 
 
 # ---------------------------------------------------------------------------
 # output
 # ---------------------------------------------------------------------------
 
-def save_outputs(document: Dict[str, Any]) -> None:
+def save_outputs(document: Dict[str, Any], no_hierarchy: List[str]) -> None:
     json_path = os.path.join(SCRIPT_DIR, config.JSON_OUTPUT_FILENAME)
     excel_path = os.path.join(SCRIPT_DIR, config.EXCEL_OUTPUT_FILENAME)
+    no_hier_path = os.path.join(SCRIPT_DIR, config.NO_HIERARCHY_FILENAME)
+
+    # Plain-text list of CWIDs with no hierarchy (excluded from JSON/Excel).
+    with open(no_hier_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(no_hierarchy) + ("\n" if no_hierarchy else ""))
+    print(f"  No-hierarchy list written: {no_hier_path} "
+          f"({len(no_hierarchy)} CWID(s))")
 
     with open(json_path, "w", encoding="utf-8") as fh:
         json.dump(document, fh, indent=2, ensure_ascii=False)
@@ -173,14 +194,17 @@ def main(argv: List[str]) -> int:
 
     db = GraphDB()
     try:
-        document = build_output_document(cwids, db)
+        document, no_hierarchy = build_output_document(cwids, db)
     except GraphDBError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
     print("\nSaving outputs ...")
-    save_outputs(document)
-    print("\nDone.")
+    save_outputs(document, no_hierarchy)
+    print(
+        f"\nDone. {document['header']['with_hierarchy']} CWID(s) with hierarchy, "
+        f"{document['header']['without_hierarchy']} without."
+    )
     return 0
 
 

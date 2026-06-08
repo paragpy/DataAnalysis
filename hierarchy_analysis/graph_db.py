@@ -45,6 +45,11 @@ def _extract_nodes(payload: Any) -> List[Dict[str, Any]]:
     if isinstance(payload, list):
         candidate = payload
     elif isinstance(payload, dict):
+        # A single node object is returned directly as a dict carrying tag/vid
+        # (and its own "edges" list) — return it as-is rather than mistaking the
+        # nested "edges" list for the node list.
+        if "tag" in payload or "vid" in payload:
+            return [payload]
         for key in ("nodes", "data", "results", "items"):
             if isinstance(payload.get(key), list):
                 candidate = payload[key]
